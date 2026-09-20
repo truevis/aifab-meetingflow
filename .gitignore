@@ -1,0 +1,54 @@
+.streamlit/secrets.toml
+.history
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.env
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+todo.md
+.cursorrules
+
+logs/
+testing/logs/
+
+# QA output files (generated during testing)
+qa/qa_pairs.json
+qa/qa_pairs_evaluation.json
+qa/qa_report_*.md
+qa/logs/
+qa_bm25/qa_pairs.json
+qa_bm25/qa_pairs_evaluation.json
+qa_bm25/qa_report_*.md
+qa_bm25/compare_report_*.md
+qa_bm25/logs/
+
+# Local benchmark database copy
+db/vectors_bm25.db
+
+.cursor/
+*.json
+qa/qa*.md
+qa/qa*.json
+
+qa_top_k/runs/*
+
