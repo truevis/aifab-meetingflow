@@ -52,3 +52,5 @@ qa/qa*.json
 
 qa_top_k/runs/*
 
+vids/
+

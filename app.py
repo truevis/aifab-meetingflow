@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,12 @@ import streamlit as st
 
 from utils.flowchart_generator import build_mermaid_flowchart
 from utils.meeting_analyzer import (
+    DEFAULT_MODEL,
+    GEMINI_FLASH_MODEL,
+    GLM_FLASH_LATEST_MODEL,
+    JEV_MODEL,
+    analyze_transcript_with_gemini,
+    analyze_transcript_with_glm,
     analyze_transcript_with_jev,
     analyze_transcript_with_mercury,
     get_default_vl_model,
@@ -19,11 +26,33 @@ from utils.meeting_analyzer import (
     get_vl_model_label,
     get_vl_transcription_models,
     is_ling_vl_model,
+    iter_media_transcript_chunks,
+    normalize_pasted_transcript,
     transcribe_media_with_openrouter,
+    workflow_cache_fingerprint,
 )
+from utils.workflow_validator import validate_workflow_graph
 
-ENGINE_MERCURY = "mercury"
 ENGINE_JEV = "jev"
+ENGINE_MERCURY = "mercury"
+ENGINE_GLM = "glm"
+ENGINE_GEMINI = "gemini"
+FLOWCHART_ENGINES = (ENGINE_JEV, ENGINE_MERCURY, ENGINE_GLM, ENGINE_GEMINI)
+ENGINE_LABELS = {
+    ENGINE_JEV: "Jev hybrid",
+    ENGINE_MERCURY: "Mercury",
+    ENGINE_GLM: "GLM Flash latest",
+    ENGINE_GEMINI: "Gemini 3.8 Flash",
+}
+DEFAULT_FLOWCHART_ENGINE = ENGINE_MERCURY
+SOURCE_UPLOAD = "Video or audio"
+SOURCE_PASTE = "Paste transcript"
+MEDIA_FILE_EXTENSIONS = ("mp4", "mov", "m4a", "mp3", "wav")
+TRANSCRIPT_FILE_EXTENSIONS = ("txt", "md")
+
+
+TRANSCRIPT_BOX_HEIGHT = 180
+TRANSCRIPT_STREAM_PAINT_SECONDS = 0.1
 
 
 def get_openrouter_api_key() -> str:
@@ -49,11 +78,6 @@ def _is_non_english(data: dict[str, Any]) -> bool:
     return any(ord(char) > 0x2E80 for char in sample_text)
 
 
-def _selected_engine(use_jev: bool) -> str:
-    """Return the flowchart cache key for the sidebar toggle."""
-    return ENGINE_JEV if use_jev else ENGINE_MERCURY
-
-
 def _transcript_from_meeting(meeting_data: dict[str, Any]) -> str:
     """Build transcript textarea text from cached meeting utterances."""
     return "\n".join(
@@ -70,35 +94,107 @@ def _empty_meeting_data() -> dict[str, Any]:
         "edges": [],
         "lanes": [],
         "confirmations": [],
+        "alternatives": [],
+        "cache_fingerprint": "",
     }
 
 
-def _engine_display_name(use_jev: bool) -> str:
+def _engine_model_id(engine: str) -> str:
+    """Return the model identity stored in a workflow cache fingerprint."""
+    if engine == ENGINE_JEV:
+        return JEV_MODEL
+    if engine == ENGINE_GLM:
+        return GLM_FLASH_LATEST_MODEL
+    if engine == ENGINE_GEMINI:
+        return GEMINI_FLASH_MODEL
+    return DEFAULT_MODEL
+
+
+def _expected_cache_fingerprint(engine: str) -> str:
+    """Fingerprint the current transcript, engine/model, translation, and schema revision."""
+    return workflow_cache_fingerprint(
+        str(st.session_state.get("transcript_input") or ""),
+        engine,
+        _engine_model_id(engine),
+        bool(st.session_state.get("translate_to_english")),
+    )
+
+
+def _engine_display_name(engine: str) -> str:
     """Return the human-readable name of the selected flowchart engine."""
-    return "Jev" if use_jev else "Mercury 2.5"
+    return ENGINE_LABELS.get(engine, engine)
 
 
 def _engine_has_result(engine: str) -> bool:
-    """Return whether the selected engine already has a cached flowchart."""
-    return bool(st.session_state.get("engine_has_result", {}).get(engine))
+    """Return whether the selected engine has a cached flowchart for the current input."""
+    if not st.session_state.get("engine_has_result", {}).get(engine):
+        return False
+    meeting = st.session_state.get("meeting_by_engine", {}).get(engine) or {}
+    stored = str(meeting.get("cache_fingerprint") or "")
+    if not stored:
+        return False
+    return stored == _expected_cache_fingerprint(engine)
+
+
+def _meeting_for_display(engine: str) -> dict[str, Any]:
+    """Return cached meeting data only when its fingerprint matches the current input."""
+    if _engine_has_result(engine):
+        return st.session_state.meeting_by_engine.get(engine) or _empty_meeting_data()
+    return _empty_meeting_data()
+
+
+def _empty_engine_flags() -> dict[str, bool]:
+    """Return a False flag for every flowchart engine."""
+    return {engine: False for engine in FLOWCHART_ENGINES}
+
+
+def _empty_engine_meetings() -> dict[str, dict[str, Any]]:
+    """Return an empty meeting payload for every flowchart engine."""
+    return {engine: _empty_meeting_data() for engine in FLOWCHART_ENGINES}
+
+
+def _ensure_engine_slots() -> None:
+    """Ensure every flowchart engine has a meeting cache and result flag."""
+    meetings = st.session_state.setdefault("meeting_by_engine", {})
+    results = st.session_state.setdefault("engine_has_result", {})
+    for engine in FLOWCHART_ENGINES:
+        meetings.setdefault(engine, _empty_meeting_data())
+        results.setdefault(engine, False)
+
+
+def _selected_flowchart_engine() -> str:
+    """Return the currently selected flowchart engine from session state."""
+    engine = st.session_state.get("flowchart_engine", DEFAULT_FLOWCHART_ENGINE)
+    if engine in FLOWCHART_ENGINES:
+        return engine
+    return DEFAULT_FLOWCHART_ENGINE
 
 
 def _reset_to_sample_meeting() -> None:
-    """Load the English sample into both engine caches and the displayed meeting."""
+    """Load the English sample into every engine cache and the displayed meeting."""
+    sample = get_sample_meeting_data()
     st.session_state.meeting_by_engine = {
-        ENGINE_MERCURY: copy.deepcopy(get_sample_meeting_data()),
-        ENGINE_JEV: copy.deepcopy(get_sample_meeting_data()),
+        engine: copy.deepcopy(sample) for engine in FLOWCHART_ENGINES
     }
-    st.session_state.engine_has_result = {ENGINE_MERCURY: True, ENGINE_JEV: True}
+    st.session_state.engine_has_result = {engine: True for engine in FLOWCHART_ENGINES}
     st.session_state.engine_errors = {}
-    engine = _selected_engine(bool(st.session_state.get("flowchart_use_jev", False)))
+    engine = _selected_flowchart_engine()
     st.session_state.current_meeting = st.session_state.meeting_by_engine[engine]
     st.session_state.transcript_input = _transcript_from_meeting(st.session_state.current_meeting)
+    _bump_transcript_box()
+    translate_to_english = bool(st.session_state.get("translate_to_english"))
+    for sample_engine, meeting in st.session_state.meeting_by_engine.items():
+        meeting["alternatives"] = list(meeting.get("alternatives") or [])
+        meeting["cache_fingerprint"] = workflow_cache_fingerprint(
+            st.session_state.transcript_input,
+            sample_engine,
+            _engine_model_id(sample_engine),
+            translate_to_english,
+        )
 
 
-def _sync_current_meeting_from_engine(use_jev: bool) -> None:
+def _sync_current_meeting_from_engine(engine: str) -> None:
     """Point the displayed meeting at the cached payload for the selected engine."""
-    engine = _selected_engine(use_jev)
     caches = st.session_state.get("meeting_by_engine", {})
     if engine in caches:
         st.session_state.current_meeting = caches[engine]
@@ -106,21 +202,19 @@ def _sync_current_meeting_from_engine(use_jev: bool) -> None:
 
 def _initialize_state() -> None:
     """Initialize session state variables."""
-    if "flowchart_use_jev" not in st.session_state:
-        st.session_state.flowchart_use_jev = False
+    if "flowchart_engine" not in st.session_state:
+        st.session_state.flowchart_engine = DEFAULT_FLOWCHART_ENGINE
     if "translate_to_english" not in st.session_state:
         st.session_state.translate_to_english = False
     if "engine_errors" not in st.session_state:
         st.session_state.engine_errors = {}
     if "engine_has_result" not in st.session_state:
-        st.session_state.engine_has_result = {ENGINE_MERCURY: False, ENGINE_JEV: False}
+        st.session_state.engine_has_result = _empty_engine_flags()
     if "meeting_by_engine" not in st.session_state:
-        st.session_state.meeting_by_engine = {
-            ENGINE_MERCURY: _empty_meeting_data(),
-            ENGINE_JEV: _empty_meeting_data(),
-        }
+        st.session_state.meeting_by_engine = _empty_engine_meetings()
+    _ensure_engine_slots()
     if "current_meeting" not in st.session_state:
-        engine = _selected_engine(bool(st.session_state.get("flowchart_use_jev", False)))
+        engine = _selected_flowchart_engine()
         st.session_state.current_meeting = st.session_state.meeting_by_engine.get(
             engine, _empty_meeting_data()
         )
@@ -128,6 +222,10 @@ def _initialize_state() -> None:
         st.session_state.is_analyzing = False
     if "transcript_input" not in st.session_state:
         st.session_state.transcript_input = _transcript_from_meeting(st.session_state.current_meeting)
+    if "imported_transcript_id" not in st.session_state:
+        st.session_state.imported_transcript_id = None
+    if "transcript_box_nonce" not in st.session_state:
+        st.session_state.transcript_box_nonce = 0
 
 
 def _render_header() -> None:
@@ -218,11 +316,31 @@ def _render_flowchart_view(meeting_data: dict[str, Any]) -> None:
     nodes = meeting_data.get("nodes", [])
     edges = meeting_data.get("edges", [])
     lanes = meeting_data.get("lanes", [])
-    empty_caption = "No flowchart yet. Upload a meeting or load the sample."
+    empty_caption = (
+        "No flowchart yet. Upload a meeting, import a transcript file, "
+        "paste a transcript, or load the sample."
+    )
+    if _engine_has_result(_selected_flowchart_engine()) and not nodes:
+        empty_caption = "No supported workflow found"
 
     tab1, tab2, tab3 = st.tabs(["📊 Flowchart Diagram", "📋 Step Table", "📝 Markdown Source"])
 
     with tab1:
+        alternatives = meeting_data.get("alternatives") or []
+        if alternatives:
+            labels = []
+            for item in alternatives:
+                if isinstance(item, str) and item.strip():
+                    labels.append(item.strip())
+                elif isinstance(item, dict):
+                    label = str(item.get("label") or item.get("text") or "").strip()
+                    if label:
+                        labels.append(label)
+            if labels:
+                st.info(
+                    "Alternatives not on the main path: "
+                    + "; ".join(_display_text(label) for label in labels)
+                )
         if not nodes:
             st.caption(empty_caption)
         else:
@@ -249,7 +367,7 @@ def _render_flowchart_view(meeting_data: dict[str, Any]) -> None:
             )
 
 
-def _render_sidebar() -> tuple[str, bool, bool, bool]:
+def _render_sidebar() -> tuple[str, str, bool, bool]:
     """Render sidebar decision controls and return VL model, engine, translate, and create-click."""
     models = get_vl_transcription_models()
     model_ids = [model["id"] for model in models]
@@ -274,23 +392,25 @@ def _render_sidebar() -> tuple[str, bool, bool, bool]:
         key="translate_to_english",
         help="Turn on if the recorded meeting is in another language (e.g. Japanese, Spanish) and needs translation to English.",
     )
-    use_jev = st.sidebar.toggle(
-        "Use Jev instead of Mercury for flowchart",
-        key="flowchart_use_jev",
-        help="Off = Mercury 2.5. On = Jev. Switching shows that engine's cached flowchart if one exists.",
+    engine = st.sidebar.radio(
+        "Flowchart model",
+        options=list(FLOWCHART_ENGINES),
+        format_func=_engine_display_name,
+        key="flowchart_engine",
+        help="Used to extract a Mermaid flowchart from the meeting transcript. Jev hybrid: Mercury synthesizes the graph and Jev checks supported relationships. Switching shows that model's cached flowchart if one exists.",
     )
-    engine_label = _engine_display_name(use_jev)
+    engine_label = _engine_display_name(engine)
     create_clicked = st.sidebar.button(
         f"Create flowchart with {engine_label}",
         type="primary",
         use_container_width=True,
         help="Runs only the currently selected flowchart model on the meeting transcript.",
     )
-    if not _engine_has_result(_selected_engine(use_jev)):
+    if not _engine_has_result(engine):
         st.sidebar.caption(
             f"No {engine_label} flowchart yet. Click the button above to generate it."
         )
-    return selected_model, use_jev, translate_to_english, create_clicked
+    return selected_model, engine, translate_to_english, create_clicked
 
 
 def _read_uploaded_media(uploaded_file: Any) -> tuple[bytes, str]:
@@ -298,15 +418,74 @@ def _read_uploaded_media(uploaded_file: Any) -> tuple[bytes, str]:
     return uploaded_file.getvalue(), uploaded_file.name
 
 
+def _file_extension(filename: str) -> str:
+    """Return a lowercase file extension without the leading dot."""
+    return Path(str(filename or "")).suffix.lower().lstrip(".")
+
+
+def _is_transcript_file(uploaded_file: Any | None) -> bool:
+    """Return whether an uploaded file is a text or Markdown transcript."""
+    if uploaded_file is None:
+        return False
+    return _file_extension(getattr(uploaded_file, "name", "")) in TRANSCRIPT_FILE_EXTENSIONS
+
+
+def _decode_uploaded_text(file_bytes: bytes) -> str:
+    """Decode transcript file bytes, preferring UTF-8 with an optional BOM."""
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            return file_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return file_bytes.decode("utf-8", errors="replace")
+
+
+def _read_uploaded_transcript(uploaded_file: Any) -> str:
+    """Read and normalize a TXT or Markdown transcript upload."""
+    return normalize_pasted_transcript(_decode_uploaded_text(uploaded_file.getvalue()).strip())
+
+
+def _imported_file_identity(uploaded_file: Any) -> tuple[str, int]:
+    """Identify an imported transcript so later edits are not overwritten."""
+    return (str(uploaded_file.name), int(uploaded_file.size))
+
+
+def _bump_transcript_box() -> None:
+    """Remount the Meeting Transcript box so a newly loaded value is shown."""
+    st.session_state.transcript_box_nonce = int(st.session_state.get("transcript_box_nonce") or 0) + 1
+
+
+def _apply_imported_transcript_file(uploaded_file: Any) -> None:
+    """Load a newly selected transcript file into the Meeting Transcript box."""
+    identity = _imported_file_identity(uploaded_file)
+    if st.session_state.get("imported_transcript_id") == identity:
+        return
+    st.session_state.transcript_input = _read_uploaded_transcript(uploaded_file)
+    st.session_state.imported_transcript_id = identity
+    _bump_transcript_box()
+
+
 def _analyze_with_selected_engine(
     transcript_text: str,
     api_key: str,
     translate_to_english: bool,
-    use_jev: bool,
+    engine: str,
 ) -> dict[str, Any]:
     """Run workflow extraction with only the currently selected flowchart engine."""
-    if use_jev:
+    if engine == ENGINE_JEV:
         return analyze_transcript_with_jev(
+            transcript_text,
+            api_key=api_key,
+            translate_to_english=translate_to_english,
+        )
+    if engine == ENGINE_GLM:
+        return analyze_transcript_with_glm(
+            transcript_text,
+            api_key=api_key,
+            translate_to_english=translate_to_english,
+        )
+    if engine == ENGINE_GEMINI:
+        return analyze_transcript_with_gemini(
             transcript_text,
             api_key=api_key,
             translate_to_english=translate_to_english,
@@ -322,6 +501,7 @@ def _store_engine_analysis(
     engine: str,
     analyzed: dict[str, Any],
     translate_to_english: bool,
+    transcript_text: str = "",
 ) -> None:
     """Cache a successful analysis for one engine and display it."""
     meeting = copy.deepcopy(st.session_state.meeting_by_engine.get(engine) or _empty_meeting_data())
@@ -329,74 +509,327 @@ def _store_engine_analysis(
     meeting["edges"] = analyzed.get("edges", [])
     meeting["lanes"] = analyzed.get("lanes", [])
     meeting["confirmations"] = analyzed.get("confirmations", [])
+    meeting["alternatives"] = analyzed.get("alternatives", [])
+    meeting["validation_warnings"] = analyzed.get("validation_warnings", [])
     if analyzed.get("utterances"):
         meeting["utterances"] = analyzed["utterances"]
+    displayed_transcript = transcript_text
+    if translate_to_english and analyzed.get("translated_transcript"):
+        displayed_transcript = str(analyzed["translated_transcript"])
+        st.session_state.transcript_input = displayed_transcript
+    meeting["cache_fingerprint"] = workflow_cache_fingerprint(
+        displayed_transcript,
+        engine,
+        _engine_model_id(engine),
+        translate_to_english,
+    )
     st.session_state.meeting_by_engine[engine] = meeting
     st.session_state.engine_has_result[engine] = True
     st.session_state.engine_errors[engine] = None
     st.session_state.current_meeting = meeting
-    if translate_to_english and analyzed.get("translated_transcript"):
-        st.session_state.transcript_input = analyzed["translated_transcript"]
+
+
+def _parse_embedded_json(text: str) -> Any:
+    """Parse the first JSON object embedded in a string, if present."""
+    start = str(text).find("{")
+    if start < 0:
+        return None
+    try:
+        payload, _end = json.JSONDecoder().raw_decode(str(text)[start:])
+    except ValueError:
+        return None
+    return payload
+
+
+def _nested_provider_message(error_obj: dict[str, Any]) -> str:
+    """Read a provider's inner error message from OpenRouter metadata."""
+    metadata = error_obj.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("raw")
+    if isinstance(raw, dict):
+        return str(raw.get("message") or raw.get("reason") or "").strip()
+    if isinstance(raw, str):
+        parsed = _parse_embedded_json(raw)
+        if isinstance(parsed, dict):
+            return str(parsed.get("message") or parsed.get("reason") or "").strip()
+        return raw.strip()
+    return ""
+
+
+def _provider_error_message(error: BaseException) -> str:
+    """Return the most specific OpenRouter/provider error text available."""
+    parsed = _parse_embedded_json(str(error))
+    if isinstance(parsed, dict):
+        error_obj = parsed.get("error")
+        if isinstance(error_obj, dict):
+            nested = _nested_provider_message(error_obj)
+            if nested:
+                return nested
+            message = str(error_obj.get("message") or "").strip()
+            if message and message.lower() != "provider returned error":
+                return message
+        elif isinstance(error_obj, str) and error_obj.strip():
+            return error_obj.strip()
+    return str(error).strip()
+
+
+def _friendly_transcription_reason(detail: str) -> str:
+    """Rewrite common provider failures into a short user-facing reason."""
+    lowered = detail.lower()
+    if "too large" in lowered or "must be less than" in lowered:
+        return "the uploaded file is too large for this model."
+    if "timed out" in lowered or "timeout" in lowered:
+        return "the model took too long to return a transcript. Long videos often succeed with another model."
+    if "too long" in lowered or "duration" in lowered:
+        return "the uploaded file is too long for this model."
+    reason = detail.strip().rstrip(".")
+    if not reason:
+        return "the selected model could not transcribe this file."
+    return f"{reason}."
+
+
+def _other_vl_model_suggestion(current_model_id: str) -> str:
+    """Name other sidebar video-to-text models the user can try."""
+    labels = [
+        model["label"]
+        for model in get_vl_transcription_models()
+        if model["id"] != current_model_id
+    ]
+    if not labels:
+        return "a different Video-to-text model in the sidebar"
+    if len(labels) == 1:
+        example = labels[0]
+    elif len(labels) == 2:
+        example = f"{labels[0]} or {labels[1]}"
+    else:
+        example = f"{', '.join(labels[:-1])}, or {labels[-1]}"
+    return f"a different Video-to-text model in the sidebar, such as {example}"
+
+
+def _format_transcription_error(error: BaseException, vl_model: str) -> str:
+    """Build a short transcription failure message that suggests another model."""
+    model_label = get_vl_model_label(vl_model)
+    reason = _friendly_transcription_reason(_provider_error_message(error))
+    suggestion = _other_vl_model_suggestion(vl_model)
+    return (
+        f"Transcription with {model_label} failed: {reason} "
+        f"Try {suggestion}."
+    )
+
+
+def _set_engine_error(engine: str, message: str) -> None:
+    """Store and display an extract-flow error for the selected engine."""
+    text = _display_text(message)
+    st.session_state.engine_errors[engine] = text
+    st.error(text)
+
+
+def _transcript_box_help(paste_source: bool) -> str:
+    """Return the Meeting Transcript input help text."""
+    if paste_source:
+        return (
+            "Paste a full meeting transcript, or import a TXT or Markdown file. "
+            "Timestamped captions, including YouTube-style lines such as "
+            "'0:2222 seconds...', are accepted. Video-to-text extraction is skipped."
+        )
+    return (
+        "Full meeting transcript. Uploaded video or audio streams into this box as it is transcribed. "
+        "A TXT or Markdown transcript file loads here directly. You can also paste a transcript. "
+        "The selected flowchart model runs only after this text is complete."
+    )
+
+
+def _show_transcript_box(
+    slot: Any,
+    text: str,
+    *,
+    disabled: bool,
+    paste_source: bool = False,
+    collapse_label: bool = True,
+) -> str:
+    """Render the Meeting Transcript text area into a placeholder slot."""
+    return slot.text_area(
+        "Meeting Transcript",
+        value=text,
+        height=TRANSCRIPT_BOX_HEIGHT,
+        disabled=disabled,
+        label_visibility="collapsed" if collapse_label else "visible",
+        placeholder=(
+            "Paste a meeting transcript here. YouTube-style timestamps are supported."
+            if paste_source
+            else ""
+        ),
+        help=_transcript_box_help(paste_source),
+        key=f"transcript_box_{st.session_state.get('transcript_box_nonce', 0)}",
+    )
+
+
+def _show_streaming_transcript(slot: Any, text: str) -> None:
+    """Show in-progress transcript text in the Meeting Transcript box."""
+    with slot.container(height=TRANSCRIPT_BOX_HEIGHT, border=True):
+        st.text(text or " ")
+
+
+def _stream_transcript_into_box(slot: Any, chunks: Any) -> str:
+    """Paint incoming transcript chunks into the Meeting Transcript box."""
+    parts: list[str] = []
+    last_paint = 0.0
+    _show_streaming_transcript(
+        slot,
+        "Waiting for the video-to-text model to start returning the transcript...",
+    )
+    try:
+        for chunk in chunks:
+            if not chunk:
+                continue
+            parts.append(str(chunk))
+            now = time.monotonic()
+            if now - last_paint >= TRANSCRIPT_STREAM_PAINT_SECONDS:
+                _show_streaming_transcript(slot, "".join(parts))
+                last_paint = now
+    except Exception:
+        partial = "".join(parts).strip()
+        if partial:
+            st.session_state.transcript_input = partial
+            _bump_transcript_box()
+            _show_transcript_box(slot, partial, disabled=False)
+        raise
+    text = "".join(parts).strip()
+    st.session_state.transcript_input = text
+    _bump_transcript_box()
+    _show_transcript_box(slot, text, disabled=False)
+    return text
+
+
+def _gather_meeting_transcript(
+    transcript_text: str,
+    api_key: str,
+    uploaded_file: Any | None,
+    vl_model: str,
+    transcript_slot: Any | None = None,
+) -> str:
+    """Return the complete meeting transcript, transcribing media first when needed."""
+    if _is_transcript_file(uploaded_file):
+        gathered = _read_uploaded_transcript(uploaded_file)
+        st.session_state.transcript_input = gathered
+        return gathered
+    if uploaded_file is not None:
+        file_bytes, filename = _read_uploaded_media(uploaded_file)
+        if transcript_slot is not None:
+            gathered = _stream_transcript_into_box(
+                transcript_slot,
+                iter_media_transcript_chunks(
+                    file_bytes,
+                    filename,
+                    api_key=api_key,
+                    model=vl_model,
+                ),
+            )
+        else:
+            gathered = str(
+                transcribe_media_with_openrouter(
+                    file_bytes,
+                    filename,
+                    api_key=api_key,
+                    model=vl_model,
+                )
+                or ""
+            ).strip()
+            st.session_state.transcript_input = gathered
+        return gathered
+    return normalize_pasted_transcript(str(transcript_text or "").strip())
 
 
 def _handle_run_analysis(
     transcript_text: str,
     api_key: str,
     translate_to_english: bool,
-    use_jev: bool,
+    engine: str,
     uploaded_file: Any | None = None,
     vl_model: str = "",
+    transcript_slot: Any | None = None,
 ) -> None:
-    """Transcribe if needed, then extract a flowchart with only the selected engine."""
+    """Gather the full transcript first, then extract a flowchart with the selected engine."""
     if not api_key:
         st.error("Please configure your OpenRouter API key in .streamlit/secrets.toml or environment variables.")
         return
 
-    engine = _selected_engine(use_jev)
-    engine_label = _engine_display_name(use_jev)
+    engine_label = _engine_display_name(engine)
     selected_vl_model = vl_model or get_default_vl_model()
     vl_label = get_vl_model_label(selected_vl_model)
-    if uploaded_file is not None:
-        spinner_msg = f"Transcribing with {vl_label}, then extracting workflow with {engine_label}..."
-    elif translate_to_english:
-        spinner_msg = f"Translating meeting to English and extracting workflow diagram with {engine_label}..."
-    else:
-        spinner_msg = f"Extracting workflow diagram with {engine_label}..."
+    gather_label = (
+        f"Transcribing meeting with {vl_label}..."
+        if uploaded_file is not None and not _is_transcript_file(uploaded_file)
+        else "Gathering meeting transcript..."
+    )
 
-    with st.spinner(spinner_msg):
+    with st.status(gather_label, expanded=True) as status:
         try:
-            analysis_text = transcript_text
-            if uploaded_file is not None:
-                file_bytes, filename = _read_uploaded_media(uploaded_file)
-                analysis_text = transcribe_media_with_openrouter(
-                    file_bytes,
-                    filename,
-                    api_key=api_key,
-                    model=selected_vl_model,
-                )
-                st.session_state.transcript_input = analysis_text
+            analysis_text = _gather_meeting_transcript(
+                transcript_text,
+                api_key=api_key,
+                uploaded_file=uploaded_file,
+                vl_model=selected_vl_model,
+                transcript_slot=transcript_slot,
+            )
+        except Exception as error:
+            status.update(label="Transcription failed", state="error")
+            _set_engine_error(engine, _format_transcription_error(error, selected_vl_model))
+            return
 
+        if not analysis_text:
+            status.update(label="No transcript to analyze", state="error")
+            _set_engine_error(
+                engine,
+                f"Gather a complete meeting transcript before querying {engine_label}. "
+                "Upload a video or audio file, import a TXT or Markdown transcript, "
+                "or choose Paste transcript and paste the text, then extract the workflow.",
+            )
+            return
+
+        extract_label = (
+            f"Translating meeting to English and extracting workflow with {engine_label}..."
+            if translate_to_english
+            else f"Extracting workflow with {engine_label}..."
+        )
+        status.update(label=extract_label, state="running")
+        try:
             analyzed = _analyze_with_selected_engine(
                 analysis_text,
                 api_key=api_key,
                 translate_to_english=translate_to_english,
-                use_jev=use_jev,
+                engine=engine,
             )
-            if "nodes" in analyzed and "edges" in analyzed:
-                _store_engine_analysis(engine, analyzed, translate_to_english)
+            validate_workflow_graph(analyzed)
+            _store_engine_analysis(
+                engine,
+                analyzed,
+                translate_to_english,
+                transcript_text=analysis_text,
+            )
+            if analyzed["nodes"]:
+                status.update(
+                    label=f"{engine_label} flowchart ready",
+                    state="complete",
+                    expanded=False,
+                )
                 success_msg = (
                     f"Successfully translated to American English and updated the {engine_label} workflow diagram!"
                     if translate_to_english
-                    else f"Workflow diagram successfully generated with {engine_label}!"
+                    else f"Workflow diagram generated with {engine_label}."
                 )
                 st.success(success_msg)
             else:
-                st.session_state.engine_errors[engine] = "The analysis response format was invalid."
-                st.error(st.session_state.engine_errors[engine])
+                status.update(
+                    label="No supported workflow found",
+                    state="complete",
+                    expanded=False,
+                )
+                st.info("The transcript did not establish an executable workflow.")
         except Exception as error:
-            message = _display_text(f"{engine_label} analysis error occurred: {error}")
-            st.session_state.engine_errors[engine] = message
-            st.error(message)
+            status.update(label=f"{engine_label} analysis failed", state="error")
+            _set_engine_error(engine, f"{engine_label} analysis error occurred: {error}")
 
 
 def _handle_add_speech_utterance(new_utterance: str, speaker_name: str) -> None:
@@ -421,19 +854,78 @@ def _handle_add_speech_utterance(new_utterance: str, speaker_name: str) -> None:
     st.session_state.current_meeting["utterances"] = utterances
 
 
-def _render_input_controls(use_jev: bool, translate_to_english: bool) -> tuple[str, bool, Any]:
-    """Render meeting video upload, sample scenario loader, extract button, and transcript input."""
-    uploaded_video = st.file_uploader(
-        "Upload Meeting Video or Audio (MP4, MOV, MP3, WAV)",
-        type=["mp4", "mov", "m4a", "mp3", "wav"],
-        help="Upload a video or audio file to generate the workflow diagram.",
+def _render_meeting_source_selector() -> str:
+    """Render the video-or-paste source control and return the selected source."""
+    selected = st.segmented_control(
+        "Meeting source",
+        options=[SOURCE_UPLOAD, SOURCE_PASTE],
+        default=SOURCE_UPLOAD,
+        key="meeting_source",
+        help="Paste or import an existing transcript to skip video-to-text extraction.",
     )
+    return selected or SOURCE_UPLOAD
 
-    if uploaded_video is not None:
+
+def _render_transcript_input(paste_source: bool) -> tuple[str, Any]:
+    """Render the meeting transcript box and persist pasted text across reruns."""
+    if paste_source:
+        st.caption(
+            "Paste or import an existing transcript. Extraction uses this text and skips video-to-text."
+        )
+        transcript_slot = st.empty()
+        transcript = _show_transcript_box(
+            transcript_slot,
+            st.session_state.transcript_input,
+            disabled=False,
+            paste_source=True,
+            collapse_label=False,
+        )
+    else:
+        with st.expander("Meeting Transcript", expanded=True):
+            transcript_slot = st.empty()
+            transcript = _show_transcript_box(
+                transcript_slot,
+                st.session_state.transcript_input,
+                disabled=False,
+                paste_source=False,
+            )
+    st.session_state.transcript_input = transcript
+    return transcript, transcript_slot
+
+
+def _render_meeting_file_uploader(paste_source: bool) -> Any:
+    """Render the meeting file uploader and load TXT/MD transcripts into the transcript box."""
+    if paste_source:
+        uploaded = st.file_uploader(
+            "Import transcript file (TXT, MD)",
+            type=list(TRANSCRIPT_FILE_EXTENSIONS),
+            help="Load a meeting transcript from a text or Markdown file. Video-to-text extraction is skipped.",
+            key="transcript_import_uploader",
+        )
+        if _is_transcript_file(uploaded):
+            _apply_imported_transcript_file(uploaded)
+        return None
+    uploaded = st.file_uploader(
+        "Upload Meeting Video, Audio, or Transcript (MP4, MOV, MP3, WAV, TXT, MD)",
+        type=[*MEDIA_FILE_EXTENSIONS, *TRANSCRIPT_FILE_EXTENSIONS],
+        help="Upload a video or audio file to transcribe, or a TXT/MD transcript file to skip video-to-text.",
+        key="meeting_file_uploader",
+    )
+    if _is_transcript_file(uploaded):
+        _apply_imported_transcript_file(uploaded)
+        return None
+    if uploaded is not None:
         with st.expander("Meeting video preview"):
-            st.video(uploaded_video)
+            st.video(uploaded)
+    return uploaded
 
-    engine_label = _engine_display_name(use_jev)
+
+def _render_input_controls(engine: str, translate_to_english: bool) -> tuple[str, bool, Any, Any, bool]:
+    """Render meeting source, sample loader, extract button, and transcript input."""
+    paste_source = _render_meeting_source_selector() == SOURCE_PASTE
+    uploaded_video = _render_meeting_file_uploader(paste_source)
+
+    engine_label = _engine_display_name(engine)
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         load_sample = st.button("Load sample transcript and flowchart", use_container_width=True)
@@ -448,16 +940,8 @@ def _render_input_controls(use_jev: bool, translate_to_english: bool) -> tuple[s
     if load_sample:
         _reset_to_sample_meeting()
 
-    with st.expander("Meeting Transcript"):
-        transcript = st.text_area(
-            "Meeting Transcript",
-            value=st.session_state.transcript_input,
-            height=180,
-            label_visibility="collapsed",
-            help="Transcript text from the meeting. If 'Translate meeting to English' is enabled in the sidebar, it will be translated.",
-        )
-
-    return transcript, run_llm, uploaded_video
+    transcript, transcript_slot = _render_transcript_input(paste_source)
+    return transcript, run_llm, uploaded_video, transcript_slot, paste_source
 
 
 def main() -> None:
@@ -468,45 +952,53 @@ def main() -> None:
         layout="wide",
     )
     _initialize_state()
-    vl_model, use_jev, translate_to_english, create_clicked = _render_sidebar()
-    _sync_current_meeting_from_engine(use_jev)
+    vl_model, engine, translate_to_english, create_clicked = _render_sidebar()
+    _sync_current_meeting_from_engine(engine)
     _render_header()
 
-    meeting_data = st.session_state.current_meeting
+    meeting_data = _meeting_for_display(engine)
     _render_summary_metrics(meeting_data)
 
     left_col, right_col = st.columns([1, 2], gap="medium")
 
     with left_col:
-        transcript_text, run_llm_clicked, uploaded_file = _render_input_controls(
-            use_jev,
-            translate_to_english,
+        transcript_text, run_llm_clicked, uploaded_file, transcript_slot, paste_source = (
+            _render_input_controls(
+                engine,
+                translate_to_english,
+            )
         )
         if create_clicked or run_llm_clicked:
             api_key = get_openrouter_api_key()
+            media_for_transcript = None
+            if not paste_source:
+                media_for_transcript = uploaded_file if run_llm_clicked else None
+                if media_for_transcript is None and not str(transcript_text or "").strip():
+                    media_for_transcript = uploaded_file
             _handle_run_analysis(
                 transcript_text,
                 api_key,
                 translate_to_english,
-                use_jev,
-                uploaded_file=uploaded_file if run_llm_clicked else None,
+                engine,
+                uploaded_file=media_for_transcript,
                 vl_model=vl_model,
+                transcript_slot=transcript_slot,
             )
 
-        meeting_data = st.session_state.current_meeting
+        meeting_data = _meeting_for_display(engine)
         _render_confirmation_alert(meeting_data.get("confirmations", []))
         _render_transcript_feed(meeting_data.get("utterances", []))
 
     with right_col:
-        engine_error = st.session_state.engine_errors.get(_selected_engine(use_jev))
+        engine_error = st.session_state.engine_errors.get(engine)
         if engine_error:
             st.error(engine_error)
-        elif not _engine_has_result(_selected_engine(use_jev)):
+        elif not _engine_has_result(engine):
             st.caption(
-                f"No {_engine_display_name(use_jev)} flowchart yet. "
-                f"Click Create flowchart with {_engine_display_name(use_jev)} in the sidebar to generate it."
+                f"No {_engine_display_name(engine)} flowchart yet. "
+                f"Click Create flowchart with {_engine_display_name(engine)} in the sidebar to generate it."
             )
-        _render_flowchart_view(st.session_state.current_meeting)
+        _render_flowchart_view(_meeting_for_display(engine))
 
     # Chat / utterance input docked at bottom
     user_speech = st.chat_input("Enter utterance to simulate speech (e.g., Manager approves lease contract, then routes to Legal)")
