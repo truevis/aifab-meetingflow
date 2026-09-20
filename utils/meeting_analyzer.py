@@ -33,7 +33,7 @@ JEV_BUSINESS_THRESHOLD = 0.5
 JEV_UTTERANCE_TEXT_CHARS = 400
 JEV_STEP_LABEL_CHARS = 48
 JEV_FALLBACK_ROLES = {"Unassigned", "Other", "Facilitator"}
-WORKFLOW_SCHEMA_REVISION = "2"
+WORKFLOW_SCHEMA_REVISION = "3"
 # TypeSafe: 64k for state + all questions; 32k for state + the longest question.
 JEV_REQUEST_TOKEN_LIMIT = 64_000
 JEV_STATE_PLUS_QUESTION_TOKEN_LIMIT = 32_000
@@ -340,6 +340,9 @@ WORKFLOW LOGIC RULES:
   work when speakers only express an intention.
 - Keep alternatives not adopted out of the main execution path. If their
   status is unresolved and affects the process, ask a confirmation question.
+- Do not model a choice speakers already resolved as a decision on the main
+  path. Unused options (appointment, petition, skipped notices) stay in
+  alternatives, not as execution branches.
 - Apply explicit corrections to the earlier step instead of appending a
   correction action. Do not treat every later disagreement as a correction.
 - Order steps by supported prerequisites, not the order of utterances.
@@ -350,9 +353,19 @@ WORKFLOW LOGIC RULES:
 - Assign the role performing the action, not automatically the speaker.
   Use Unassigned and a confirmation when the responsible role is unknown.
 - Write complete, concise verb-object labels; preserve negation and conditions.
+- Never put a contested quantity or deadline into a node or edge label.
+  Put competing numbers in a confirmation with both source_ids and the
+  reference event (vacancy vs resignation vs warn vs meeting).
 - Preserve disputed quantities and deadlines in confirmation questions,
   including what event each deadline is measured from. Do not choose a value.
-- Describe future outcomes as planned. Do not manufacture a Complete endpoint.
+- Describe future events as planned. Do not add a completed or end node for
+  work that has not happened (Special election concluded, New member(s)
+  seated, invented Complete).
+- Confirmations must include the question, the competing claims, and
+  source_ids. Confidence is not a calibrated probability.
+- Return exactly one utterance annotation per supplied source segment, with
+  the same id as source_id (U12 -> id 12) and in the same order. Do not
+  summarize or merge the utterance log. Synthesize the graph separately.
 - Return empty nodes and edges when no supported workflow can be extracted.
 - Check nodes and arrows against the transcript before returning the JSON.
 """.strip()
@@ -417,7 +430,9 @@ def _workflow_system_prompt(translate_to_english: bool) -> str:
         "and directed edges (source, target, label).\n"
         "3. Detect any unclear or ambiguous items (e.g., missing responsibilities, unassigned roles) as confirmation questions.\n"
         "4. Output an utterance log with timestamp, speaker, text, "
-        "is_business (boolean), relevance_score (0.0 - 1.0), action_type (add|modify|branch|unclear|none), detected_step, and detected_role.\n"
+        "is_business (boolean), relevance_score (0.0 - 1.0), action_type (add|modify|branch|unclear|none), detected_step, and detected_role. "
+        "Return exactly one annotation per supplied source segment, same id / source_id order; "
+        "do not summarize or merge the log. Synthesize the graph separately.\n"
         "5. Output strictly valid JSON matching this schema:\n"
         "{\n"
         '  "translated_transcript": "full transcript text",\n'
@@ -432,7 +447,7 @@ def _workflow_system_prompt(translate_to_english: bool) -> str:
         '     {"source": "N1", "target": "N2", "label": "optional branch condition", "source_ids": ["U2"], "status": "planned"}\n'
         "  ],\n"
         '  "confirmations": [\n'
-        '     {"id": 1, "question": "Question text", "suggested_role": "Role", "confidence": 0.7}\n'
+        '     {"id": 1, "question": "Question text", "suggested_role": "Role", "confidence": 0.7, "source_ids": ["U1"]}\n'
         "  ],\n"
         '  "alternatives": [\n'
         '     {"label": "Unused proposal", "source_ids": ["U3"], "status": "alternative"}\n'
@@ -442,7 +457,8 @@ def _workflow_system_prompt(translate_to_english: bool) -> str:
         "  ]\n"
         "}\n"
         "status on nodes/edges is optional and must be one of adopted, planned, proposed, alternative, unresolved. "
-        "Keep facts compact. Prefer supplied source_ids over a second transcript copy."
+        "Keep facts compact. Prefer supplied source_ids over a second transcript copy. "
+        "Confirmations: question plus competing claims and source_ids. Confidence is not a calibrated probability."
     )
 
 
@@ -666,8 +682,9 @@ def _workflow_json_schema() -> dict[str, Any]:
             "question": {"type": "string"},
             "suggested_role": {"type": "string"},
             "confidence": {"type": "number"},
+            "source_ids": _source_ids_schema(),
         },
-        "required": ["id", "question", "suggested_role", "confidence"],
+        "required": ["id", "question", "suggested_role", "confidence", "source_ids"],
     }
     alternative_schema = {
         "type": "object",
@@ -849,7 +866,7 @@ def _relevant_source_segments(
 ) -> list[dict[str, str]]:
     """Return source segments cited by the current graph, or all segments."""
     cited: set[str] = set()
-    for kind in ("nodes", "edges", "alternatives", "facts"):
+    for kind in ("nodes", "edges", "alternatives", "facts", "confirmations"):
         items = payload.get(kind)
         if not isinstance(items, list):
             continue
@@ -1204,6 +1221,93 @@ def _parse_transcript_utterances(transcript_text: str) -> list[dict[str, Any]]:
     return utterances
 
 
+_UTTERANCE_ANNOTATION_FIELDS = (
+    "is_business",
+    "relevance_score",
+    "action_type",
+    "detected_step",
+    "detected_role",
+)
+
+
+def _utterance_id_lists(items: list[dict[str, Any]]) -> list[Any]:
+    """Return utterance ids in list order, using None for non-objects."""
+    return [
+        item.get("id") if isinstance(item, dict) else None
+        for item in items
+    ]
+
+
+def _utterance_ids_match_one_to_one(
+    source_utterances: list[dict[str, Any]],
+    model_utterances: list[dict[str, Any]],
+) -> bool:
+    """Return whether model utterance ids match the source list 1:1 with no duplicates."""
+    source_ids = _utterance_id_lists(source_utterances)
+    model_ids = _utterance_id_lists(model_utterances)
+    if (
+        len(source_ids) != len(model_ids)
+        or len(set(model_ids)) != len(model_ids)
+        or set(source_ids) != set(model_ids)
+    ):
+        return False
+    return all(isinstance(item_id, int) for item_id in source_ids)
+
+
+def _model_utterances_by_id(
+    model_utterances: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    """Index model utterance objects by integer id."""
+    return {
+        item.get("id"): item
+        for item in model_utterances
+        if isinstance(item, dict) and isinstance(item.get("id"), int)
+    }
+
+
+def merge_utterance_annotations(
+    source_utterances: list[dict[str, Any]],
+    model_utterances: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep every source turn and add annotations from matching model IDs."""
+    if not _utterance_ids_match_one_to_one(source_utterances, model_utterances):
+        return [dict(item) for item in source_utterances]
+    by_id = _model_utterances_by_id(model_utterances)
+    merged = []
+    for source in source_utterances:
+        item = dict(source)
+        annotation = by_id.get(item.get("id"), {})
+        if str(annotation.get("text") or "") != str(item.get("text") or ""):
+            merged.append(item)
+            continue
+        for field in _UTTERANCE_ANNOTATION_FIELDS:
+            if field in annotation:
+                item[field] = annotation[field]
+        merged.append(item)
+    return merged
+
+
+def apply_translated_utterance_annotations(
+    source_utterances: list[dict[str, Any]],
+    model_utterances: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep source identity; use model text plus annotations when IDs match 1:1."""
+    if not _utterance_ids_match_one_to_one(source_utterances, model_utterances):
+        return [dict(item) for item in source_utterances]
+    by_id = _model_utterances_by_id(model_utterances)
+    merged = []
+    for source in source_utterances:
+        item = dict(source)
+        annotation = by_id.get(item.get("id"), {})
+        if "text" in annotation:
+            item["text"] = annotation["text"]
+        for field in _UTTERANCE_ANNOTATION_FIELDS:
+            if field in annotation:
+                item[field] = annotation[field]
+        merged.append(item)
+    return merged
+
+
 def _jev_action_criteria() -> dict[str, str]:
     """Return workflow action choices for one utterance."""
     return {
@@ -1514,6 +1618,7 @@ def _workflow_from_jev_utterances(utterances: list[dict[str, Any]]) -> dict[str,
                     "question": f"Who is responsible for '{label}'?",
                     "suggested_role": lane,
                     "confidence": round(float(utterance.get("role_confidence", 0.65) or 0.65), 2),
+                    "source_ids": [f"U{utterance.get('id')}"] if utterance.get("id") else [],
                 }
             )
     end_id = f"N{len(step_utterances) + 2}"
@@ -1643,11 +1748,44 @@ def _ask_jev_question_batch(
     return answers
 
 
+def _cited_source_ids(*holders: dict[str, Any]) -> list[str]:
+    """Return unique source_ids from graph objects, preserving first-seen order."""
+    seen: list[str] = []
+    for holder in holders:
+        for source_id in holder.get("source_ids") or []:
+            text = str(source_id)
+            if text and text not in seen:
+                seen.append(text)
+    return seen
+
+
+def _format_source_excerpts(
+    source_ids: list[str],
+    segments: list[dict[str, str]],
+    max_chars: int = 80,
+) -> str:
+    """Build a short cited-segment excerpt string for a rejected-edge confirmation."""
+    texts = {
+        str(item.get("source_id") or ""): str(item.get("text") or "")
+        for item in segments
+        if str(item.get("source_id") or "")
+    }
+    parts: list[str] = []
+    for source_id in source_ids:
+        excerpt = _clip_text(texts.get(source_id, ""), max_chars)
+        if excerpt:
+            parts.append(f'{source_id} "{excerpt}"')
+        else:
+            parts.append(source_id)
+    return "; ".join(parts)
+
+
 def _append_confirmation(
     payload: dict[str, Any],
     question: str,
     suggested_role: str,
     confidence: float,
+    source_ids: list[str] | None = None,
 ) -> None:
     """Append a confirmation using the provided confidence, including zero."""
     confirmations = payload.setdefault("confirmations", [])
@@ -1660,6 +1798,7 @@ def _append_confirmation(
             "question": question,
             "suggested_role": suggested_role,
             "confidence": round(float(confidence), 2),
+            "source_ids": list(source_ids or []),
         }
     )
 
@@ -1671,6 +1810,7 @@ def _jev_bounded_graph_checks(
     model: str,
 ) -> dict[str, Any]:
     """Drop unsupported edges and confirm Unassigned owners using Jev Decisions."""
+    _ensure_workflow_lists(payload)
     questions = _jev_graph_check_questions(payload)
     if not questions:
         return payload
@@ -1688,14 +1828,20 @@ def _jev_bounded_graph_checks(
             continue
         source = nodes_by_id.get(str(edge.get("source") or ""), {})
         target = nodes_by_id.get(str(edge.get("target") or ""), {})
+        cited = _cited_source_ids(edge, source, target)
+        question = (
+            f"Is '{target.get('label') or edge.get('target')}' dependent on "
+            f"'{source.get('label') or edge.get('source')}'?"
+        )
+        excerpt = _format_source_excerpts(cited, segments)
+        if excerpt:
+            question = f"{question} Cited: {excerpt}."
         _append_confirmation(
             payload,
-            (
-                f"Is '{target.get('label') or edge.get('target')}' dependent on "
-                f"'{source.get('label') or edge.get('source')}'?"
-            ),
+            question,
             str(source.get("lane") or "Unassigned"),
             supported,
+            cited,
         )
     payload["edges"] = kept_edges
     for node in payload.get("nodes") or []:
@@ -1710,6 +1856,7 @@ def _jev_bounded_graph_checks(
             f"Who is responsible for '{node.get('label') or node_id}'?",
             "Unassigned",
             unknown,
+            _cited_source_ids(node),
         )
     return payload
 

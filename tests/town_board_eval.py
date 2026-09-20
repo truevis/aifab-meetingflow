@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import tomllib
@@ -20,6 +21,7 @@ from utils.meeting_analyzer import (
     analyze_transcript_with_glm,
     analyze_transcript_with_jev,
     analyze_transcript_with_mercury,
+    _workflow_source_segments,
 )
 from utils.workflow_validator import validate_workflow_graph
 
@@ -110,7 +112,66 @@ def score_town_board_expectations(payload: dict[str, Any]) -> list[str]:
         misses.append(
             f"Node count {len(nodes)} (meaningful {len(meaningful)}) is outside the 5–8 check."
         )
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        label = str(node.get("label") or "").casefold()
+        status = str(node.get("status") or "").casefold()
+        node_type = str(node.get("node_type") or "").casefold()
+        completed = any(token in label for token in ("concluded", "seated", "complete"))
+        if completed and (status == "planned" or node_type == "end"):
+            misses.append(
+                f"Completed-result wording on planned/end node {node.get('id')}."
+            )
+    graph_blob = label_blob + " " + _joined_text(payload.get("edges") or [], ("label",))
+    conf_blob = _joined_text(confirmations, ("question",))
+    has_day_count = bool(
+        re.search(
+            r"\b\d{1,3}\s*(?:[-–/]\s*\d{1,3})?\s*-?\s*days?\b",
+            graph_blob,
+            re.IGNORECASE,
+        )
+    )
+    timing_disputed = any(
+        token in conf_blob for token in ("days", "timing", "deadline", "notice")
+    )
+    if has_day_count and timing_disputed:
+        misses.append(
+            "A day count is asserted in a label while confirmations still dispute timing."
+        )
     return misses
+
+
+def score_utterance_coverage(payload: dict[str, Any], source_count: int) -> list[str]:
+    """Flag a model log that would replace the app feed with fewer entries."""
+    utterances = payload.get("utterances")
+    if not isinstance(utterances, list):
+        return ["Model did not return an utterance list."]
+    if len(utterances) != source_count:
+        return [
+            f"Utterance coverage {len(utterances)}/{source_count}; "
+            "the app may show a shortened transcript feed."
+        ]
+    return []
+
+
+def score_petition_evidence(payload: dict[str, Any]) -> list[str]:
+    """Check the fixture's known petition excerpts, not arbitrary IDs."""
+    petition_sources = {"U56", "U67"}
+    unrelated_sources = {"U13", "U14"}
+    for item in payload.get("alternatives") or []:
+        if not isinstance(item, dict):
+            continue
+        if "petition" not in str(item.get("label") or "").casefold():
+            continue
+        cited = set(item.get("source_ids") or [])
+        misses = []
+        if not cited & petition_sources:
+            misses.append("Petition alternative cites no petition excerpt (U56 or U67).")
+        if cited & unrelated_sources:
+            misses.append("Petition alternative cites the unrelated seat discussion (U13/U14).")
+        return misses
+    return ["Petition alternative is missing."]
 
 
 def _engine_fn(engine: str) -> Callable[..., dict[str, Any]]:
@@ -226,6 +287,9 @@ def run_engine_sample(engine: str) -> int:
         _write_and_print_report(engine, _failure_report(engine, elapsed, str(error)))
         return 1
     elapsed = time.perf_counter() - started
+    source_count = len(_workflow_source_segments(transcript))
     misses = score_town_board_expectations(payload)
+    misses.extend(score_utterance_coverage(payload, source_count))
+    misses.extend(score_petition_evidence(payload))
     _write_and_print_report(engine, _success_report(engine, payload, elapsed, misses))
     return 0

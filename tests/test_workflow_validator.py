@@ -59,6 +59,56 @@ class WorkflowGraphTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown source_id"):
             validate_workflow_graph(graph, known_source_ids={"U1"})
 
+    def test_warns_disputed_day_count_vs_confirmation(self) -> None:
+        graph = {
+            "lanes": ["Clerk"],
+            "nodes": [
+                {
+                    "id": "N1",
+                    "lane": "Clerk",
+                    "label": "Issue notice (30-day rule)",
+                    "node_type": "action",
+                    "status": "adopted",
+                }
+            ],
+            "edges": [],
+            "confirmations": [
+                {
+                    "id": 1,
+                    "question": "Is the notice period 30 or 45 days from resignation?",
+                    "suggested_role": "Clerk",
+                    "confidence": 0.5,
+                    "source_ids": ["U1"],
+                }
+            ],
+        }
+        result = validate_workflow_graph(graph, known_source_ids={"U1"})
+        self.assertIs(result, graph)
+        self.assertTrue(
+            any("day count" in warning.casefold() for warning in result["validation_warnings"])
+        )
+
+    def test_warns_without_failing_on_field_agreement(self) -> None:
+        graph = {
+            "lanes": ["Board"],
+            "nodes": [
+                {
+                    "id": "N1",
+                    "lane": "Board",
+                    "label": "Special election concluded",
+                    "node_type": "end",
+                    "status": "planned",
+                }
+            ],
+            "edges": [],
+            "confirmations": [],
+        }
+        result = validate_workflow_graph(graph)
+        self.assertIs(result, graph)
+        self.assertTrue(
+            any("completed result" in warning.casefold() for warning in result["validation_warnings"])
+        )
+
     def test_rejects_duplicate_node_ids(self) -> None:
         graph = {
             "lanes": ["Clerk"],

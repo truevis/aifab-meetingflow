@@ -17,6 +17,7 @@ from utils.meeting_analyzer import (
     GEMINI_FLASH_MODEL,
     GLM_FLASH_LATEST_MODEL,
     JEV_MODEL,
+    apply_translated_utterance_annotations,
     analyze_transcript_with_gemini,
     analyze_transcript_with_glm,
     analyze_transcript_with_jev,
@@ -27,9 +28,11 @@ from utils.meeting_analyzer import (
     get_vl_transcription_models,
     is_ling_vl_model,
     iter_media_transcript_chunks,
+    merge_utterance_annotations,
     normalize_pasted_transcript,
     transcribe_media_with_openrouter,
     workflow_cache_fingerprint,
+    _parse_transcript_utterances,
 )
 from utils.workflow_validator import validate_workflow_graph
 
@@ -95,6 +98,7 @@ def _empty_meeting_data() -> dict[str, Any]:
         "lanes": [],
         "confirmations": [],
         "alternatives": [],
+        "facts": [],
         "cache_fingerprint": "",
     }
 
@@ -185,6 +189,7 @@ def _reset_to_sample_meeting() -> None:
     translate_to_english = bool(st.session_state.get("translate_to_english"))
     for sample_engine, meeting in st.session_state.meeting_by_engine.items():
         meeting["alternatives"] = list(meeting.get("alternatives") or [])
+        meeting["facts"] = list(meeting.get("facts") or [])
         meeting["cache_fingerprint"] = workflow_cache_fingerprint(
             st.session_state.transcript_input,
             sample_engine,
@@ -250,18 +255,68 @@ def _render_summary_metrics(meeting_data: dict[str, Any]) -> None:
     col3.metric("Action Items to Confirm", len(confirmations))
 
 
-def _render_confirmation_alert(confirmations: list[dict[str, Any]]) -> None:
-    """Render prominent alert for ambiguous items that need clarification."""
-    if not confirmations:
-        return
+def _source_timestamp_lookup(utterances: list[dict[str, Any]]) -> dict[str, str]:
+    """Map U12-style source ids to cached utterance timestamps."""
+    lookup: dict[str, str] = {}
+    for item in utterances or []:
+        if not isinstance(item, dict):
+            continue
+        uid = item.get("id")
+        if isinstance(uid, int):
+            lookup[f"U{uid}"] = str(item.get("timestamp") or "").strip()
+    return lookup
 
-    for conf in confirmations:
+
+def _format_source_citations(source_ids: Any, timestamps: dict[str, str]) -> str:
+    """Join source ids with looked-up timestamps when present."""
+    if not isinstance(source_ids, list):
+        return ""
+    parts: list[str] = []
+    for source_id in source_ids:
+        key = str(source_id)
+        ts = timestamps.get(key, "")
+        parts.append(f"{key} ({ts})" if ts else key)
+    return ", ".join(parts)
+
+
+def _confirmation_sort_key(conf: dict[str, Any]) -> tuple[int, int]:
+    """Rank path-changing questions (timing, owner, unused alternative) first."""
+    question = str(conf.get("question") or "").casefold()
+    if any(token in question for token in ("timing", "deadline", "days", "notice", "when")):
+        rank = 0
+    elif any(token in question for token in ("who", "owner", "responsible", "role")):
+        rank = 1
+    elif any(
+        token in question
+        for token in ("alternative", "appoint", "petition", "unused", "instead")
+    ):
+        rank = 2
+    else:
+        rank = 3
+    conf_id = conf.get("id")
+    order = int(conf_id) if isinstance(conf_id, int) else 0
+    return (rank, order)
+
+
+def _render_confirmation_alert(
+    confirmations: list[dict[str, Any]],
+    utterances: list[dict[str, Any]] | None = None,
+) -> None:
+    """Render prominent alert for ambiguous items that need clarification."""
+    ranked = [conf for conf in confirmations if isinstance(conf, dict)]
+    if not ranked:
+        return
+    timestamps = _source_timestamp_lookup(utterances or [])
+    ranked.sort(key=_confirmation_sort_key)
+    for conf in ranked:
         question = _display_text(conf.get("question", ""))
         suggested = _display_text(conf.get("suggested_role", "Unassigned"))
-        confidence = conf.get("confidence", 0.0)
+        sources = _display_text(_format_source_citations(conf.get("source_ids"), timestamps))
+        detail = f"• Candidate Role: `{suggested}`"
+        if sources:
+            detail += f"\n\n• Sources: `{sources}`"
         st.warning(
-            f"⚠️ **Confirmation Item ({conf.get('id', 1)})**: {question}\n\n"
-            f"• Candidate Role: `{suggested}` (Confidence: {confidence:.0%})"
+            f"⚠️ **Confirmation Item ({conf.get('id', 1)})**: {question}\n\n{detail}"
         )
 
 
@@ -296,13 +351,21 @@ def _render_transcript_feed(utterances: list[dict[str, Any]]) -> None:
         _render_utterance_card(item)
 
 
-def _flowchart_table_rows(nodes: list[dict[str, Any]]) -> dict[str, list[Any]]:
+def _flowchart_table_rows(
+    nodes: list[dict[str, Any]],
+    utterances: list[dict[str, Any]] | None = None,
+) -> dict[str, list[Any]]:
     """Build a column-oriented table so st.dataframe stays valid when nodes are empty."""
+    timestamps = _source_timestamp_lookup(utterances or [])
     return {
         "Step ID": [n.get("id") for n in nodes],
         "Swimlane (Role)": [n.get("lane") for n in nodes],
         "Type": [n.get("node_type") for n in nodes],
+        "Status": [n.get("status") or "" for n in nodes],
         "Action Description": [n.get("label") for n in nodes],
+        "Sources": [
+            _format_source_citations(n.get("source_ids"), timestamps) for n in nodes
+        ],
     }
 
 
@@ -326,6 +389,11 @@ def _render_flowchart_view(meeting_data: dict[str, Any]) -> None:
     tab1, tab2, tab3 = st.tabs(["📊 Flowchart Diagram", "📋 Step Table", "📝 Markdown Source"])
 
     with tab1:
+        timestamps = _source_timestamp_lookup(meeting_data.get("utterances") or [])
+        warnings = meeting_data.get("validation_warnings") or []
+        if warnings:
+            for warning in warnings:
+                st.caption(_display_text(warning))
         alternatives = meeting_data.get("alternatives") or []
         if alternatives:
             labels = []
@@ -334,12 +402,32 @@ def _render_flowchart_view(meeting_data: dict[str, Any]) -> None:
                     labels.append(item.strip())
                 elif isinstance(item, dict):
                     label = str(item.get("label") or item.get("text") or "").strip()
-                    if label:
+                    sources = _format_source_citations(item.get("source_ids"), timestamps)
+                    if label and sources:
+                        labels.append(f"{label} ({sources})")
+                    elif label:
                         labels.append(label)
             if labels:
                 st.info(
                     "Alternatives not on the main path: "
                     + "; ".join(_display_text(label) for label in labels)
+                )
+        facts = meeting_data.get("facts") or []
+        if facts:
+            fact_lines = []
+            for item in facts:
+                if isinstance(item, str) and item.strip():
+                    fact_lines.append(item.strip())
+                elif isinstance(item, dict):
+                    text = str(item.get("text") or item.get("label") or "").strip()
+                    sources = _format_source_citations(item.get("source_ids"), timestamps)
+                    if text and sources:
+                        fact_lines.append(f"{text} ({sources})")
+                    elif text:
+                        fact_lines.append(text)
+            if fact_lines:
+                st.info(
+                    "Facts: " + "; ".join(_display_text(line) for line in fact_lines)
                 )
         if not nodes:
             st.caption(empty_caption)
@@ -350,7 +438,11 @@ def _render_flowchart_view(meeting_data: dict[str, Any]) -> None:
 
     with tab2:
         st.caption("Flowchart nodes and assigned department swimlanes:")
-        st.dataframe(_flowchart_table_rows(nodes), width="stretch", hide_index=True)
+        st.dataframe(
+            _flowchart_table_rows(nodes, meeting_data.get("utterances")),
+            width="stretch",
+            hide_index=True,
+        )
 
     with tab3:
         if not nodes:
@@ -510,13 +602,28 @@ def _store_engine_analysis(
     meeting["lanes"] = analyzed.get("lanes", [])
     meeting["confirmations"] = analyzed.get("confirmations", [])
     meeting["alternatives"] = analyzed.get("alternatives", [])
+    meeting["facts"] = analyzed.get("facts", [])
     meeting["validation_warnings"] = analyzed.get("validation_warnings", [])
-    if analyzed.get("utterances"):
-        meeting["utterances"] = analyzed["utterances"]
+    source_utterances = _parse_transcript_utterances(transcript_text)
+    model_utterances = analyzed.get("utterances")
+    if not isinstance(model_utterances, list):
+        model_utterances = []
     displayed_transcript = transcript_text
     if translate_to_english and analyzed.get("translated_transcript"):
         displayed_transcript = str(analyzed["translated_transcript"])
         st.session_state.transcript_input = displayed_transcript
+        if source_utterances:
+            meeting["utterances"] = apply_translated_utterance_annotations(
+                source_utterances, model_utterances
+            )
+        elif model_utterances:
+            meeting["utterances"] = model_utterances
+    elif source_utterances:
+        meeting["utterances"] = merge_utterance_annotations(
+            source_utterances, model_utterances
+        )
+    elif model_utterances:
+        meeting["utterances"] = model_utterances
     meeting["cache_fingerprint"] = workflow_cache_fingerprint(
         displayed_transcript,
         engine,
@@ -986,7 +1093,10 @@ def main() -> None:
             )
 
         meeting_data = _meeting_for_display(engine)
-        _render_confirmation_alert(meeting_data.get("confirmations", []))
+        _render_confirmation_alert(
+            meeting_data.get("confirmations", []),
+            meeting_data.get("utterances", []),
+        )
         _render_transcript_feed(meeting_data.get("utterances", []))
 
     with right_col:

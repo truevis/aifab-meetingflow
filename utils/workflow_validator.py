@@ -5,6 +5,23 @@ from __future__ import annotations
 import re
 from typing import Any
 
+_DAY_COUNT_RE = re.compile(
+    r"\b(\d{1,3})\s*(?:[-–/]\s*(\d{1,3}))?\s*[-–]?\s*days?\b",
+    re.IGNORECASE,
+)
+_TIMING_CONFIRM_RE = re.compile(
+    r"\b(days?|timing|deadline|notice|vacancy|resignation|warn)\b",
+    re.IGNORECASE,
+)
+_COMPLETED_RESULT_RE = re.compile(
+    r"\b(concluded|seated|completed|complete|held)\b",
+    re.IGNORECASE,
+)
+_LEGAL_REQUIREMENT_RE = re.compile(
+    r"\b(must|shall|required|requirement|statute|statutory|legal|rule|within\s+\d|days?)\b",
+    re.IGNORECASE,
+)
+_OPEN_STATUS = {"planned", "proposed", "unresolved"}
 _NODE_ID_RE = re.compile(r"N[1-9]\d*")
 _ALLOWED_NODE_TYPES = {"start", "action", "decision", "end"}
 _ALLOWED_STATUS = {"adopted", "planned", "proposed", "alternative", "unresolved"}
@@ -70,6 +87,7 @@ def normalize_incomplete_decisions(payload: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "suggested_role": str(node.get("lane") or "Unassigned"),
                 "confidence": 0.0,
+                "source_ids": list(node.get("source_ids") or []),
             }
         )
     return payload
@@ -78,7 +96,7 @@ def normalize_incomplete_decisions(payload: dict[str, Any]) -> dict[str, Any]:
 def _iter_source_id_holders(payload: dict[str, Any]) -> list[tuple[str, list[Any]]]:
     """Collect objects that may carry source_ids lists."""
     holders: list[tuple[str, list[Any]]] = []
-    for kind in ("nodes", "edges", "alternatives", "facts"):
+    for kind in ("nodes", "edges", "alternatives", "facts", "confirmations"):
         items = payload.get(kind)
         if isinstance(items, list):
             holders.append((kind, items))
@@ -159,6 +177,113 @@ def _collect_semantic_warnings(
         warnings.append(
             f"Graph has {component_count} disconnected components; confirm they are separate processes."
         )
+    return warnings
+
+
+def _confirmation_questions(payload: dict[str, Any]) -> list[str]:
+    """Return confirmation question strings from a workflow payload."""
+    questions: list[str] = []
+    for item in payload.get("confirmations") or []:
+        if isinstance(item, dict):
+            question = str(item.get("question") or "").strip()
+            if question:
+                questions.append(question)
+        elif isinstance(item, str) and item.strip():
+            questions.append(item.strip())
+    return questions
+
+
+def _day_counts_in_text(text: str) -> set[str]:
+    """Extract asserted day-count numbers from a label."""
+    counts: set[str] = set()
+    for match in _DAY_COUNT_RE.finditer(text or ""):
+        counts.add(match.group(1))
+        if match.group(2):
+            counts.add(match.group(2))
+    return counts
+
+
+def _graph_label_items(payload: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """Return (kind, identity, label) tuples for nodes and edges."""
+    items: list[tuple[str, str, str]] = []
+    for node in payload.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        label = str(node.get("label") or "")
+        if label:
+            items.append(("node", str(node.get("id") or ""), label))
+    for edge in payload.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        label = str(edge.get("label") or "")
+        if label:
+            identity = f"{edge.get('source')} -> {edge.get('target')}"
+            items.append(("edge", identity, label))
+    return items
+
+
+def _confirmation_disputes_day_count(question: str, counts: set[str]) -> bool:
+    """Return whether a confirmation asks about an asserted day count."""
+    if any(re.search(rf"\b{re.escape(count)}\b", question) for count in counts):
+        return True
+    return bool(_TIMING_CONFIRM_RE.search(question))
+
+
+def _collect_field_agreement_warnings(payload: dict[str, Any]) -> list[str]:
+    """Return non-fatal notes when labels, status, and confirmations disagree."""
+    warnings: list[str] = []
+    questions = _confirmation_questions(payload)
+    for kind, identity, label in _graph_label_items(payload):
+        counts = _day_counts_in_text(label)
+        if not counts or not questions:
+            continue
+        if any(_confirmation_disputes_day_count(question, counts) for question in questions):
+            warnings.append(
+                f"{kind.capitalize()} {identity} asserts a day count while a "
+                "confirmation still disputes that quantity."
+            )
+
+    for node in payload.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        status = node.get("status")
+        if status not in _OPEN_STATUS:
+            continue
+        label = str(node.get("label") or "")
+        if node.get("node_type") == "end" or _COMPLETED_RESULT_RE.search(label):
+            warnings.append(
+                f"Node {node.get('id')} is {status} but described as a completed result."
+            )
+    for edge in payload.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        status = edge.get("status")
+        if status not in _OPEN_STATUS:
+            continue
+        label = str(edge.get("label") or "")
+        if _COMPLETED_RESULT_RE.search(label):
+            warnings.append(
+                f"Edge {edge.get('source')} -> {edge.get('target')} is {status} "
+                "but described as completed."
+            )
+
+    conf_blob = " ".join(questions).casefold()
+    unresolved_requirement = bool(questions) and (
+        bool(_TIMING_CONFIRM_RE.search(conf_blob))
+        or "unresolved" in conf_blob
+        or "verify" in conf_blob
+        or "confirm" in conf_blob
+    )
+    if unresolved_requirement:
+        for edge in payload.get("edges") or []:
+            if not isinstance(edge, dict) or edge.get("status") != "adopted":
+                continue
+            label = str(edge.get("label") or "")
+            if _LEGAL_REQUIREMENT_RE.search(label):
+                warnings.append(
+                    f"Edge {edge.get('source')} -> {edge.get('target')} is marked "
+                    "adopted while confirmations still treat the requirement as unresolved."
+                )
     return warnings
 
 
@@ -254,5 +379,5 @@ def validate_workflow_graph(
 
     payload["validation_warnings"] = _collect_semantic_warnings(
         nodes_by_id, outgoing, incoming
-    )
+    ) + _collect_field_agreement_warnings(payload)
     return payload
