@@ -30,10 +30,7 @@ MERCURY_TIMEOUT_SECONDS = 60
 GLM_TIMEOUT_SECONDS = 90
 GEMINI_TIMEOUT_SECONDS = 90
 JEV_TIMEOUT_SECONDS = 120
-JEV_BUSINESS_THRESHOLD = 0.5
 JEV_UTTERANCE_TEXT_CHARS = 400
-JEV_STEP_LABEL_CHARS = 48
-JEV_FALLBACK_ROLES = {"Unassigned", "Other", "Facilitator"}
 WORKFLOW_SCHEMA_REVISION = "5"
 # TypeSafe: 64k for state + all questions; 32k for state + the longest question.
 JEV_REQUEST_TOKEN_LIMIT = 64_000
@@ -62,31 +59,6 @@ _YOUTUBE_DURATION_ONLY_RE = re.compile(
     re.IGNORECASE,
 )
 _BARE_TIMESTAMP_RE = re.compile(r"^(?:\d{1,2}:)?\d{1,2}:\d{2}$")
-_BRACKET_TIMESTAMP_RE = re.compile(
-    r"^\[(?:\d{1,2}:)?\d{1,2}:\d{2}(?:[:.,]\d+)?\]\s*"
-)
-_LEADING_TIMESTAMP_RE = re.compile(
-    r"^(?:\d{1,2}:)?\d{1,2}:\d{2}(?:[:.,]\d+)?\s+"
-)
-_SRT_RANGE_RE = re.compile(
-    r"^\d{1,2}:\d{2}:\d{2}[,.]\d+\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d+\s*$"
-)
-_YOUTUBE_DURATION_PREFIX_RE = re.compile(
-    r"^\d+\s+(?:hours?|minutes?|seconds?)(?:,\s*\d+\s+(?:minutes?|seconds?))?\s*",
-    re.IGNORECASE,
-)
-_SECTION_HEADING_RE = re.compile(
-    r"Section\s+(\d+)\.\s+([^?.]+?)(?:\s*[?.]|$)",
-    re.IGNORECASE,
-)
-_ANSWERED_STATUS_RE = re.compile(
-    r"\?\s*(yes|no|current|cancelled|on schedule|approved)\b",
-    re.IGNORECASE,
-)
-_PROCESS_BRANCH_RE = re.compile(
-    r"\b(if |unless |otherwise|rejected|approved vs|passed\?|failed)\b",
-    re.IGNORECASE,
-)
 _JEV_DAY_COUNT_RE = re.compile(
     r"\b(\d{1,3})\s*(?:[-–/]\s*(\d{1,3}))?\s*[-–]?\s*days?(?:\s+(?:rule|wait|period))?\b",
     re.IGNORECASE,
@@ -1225,108 +1197,6 @@ def _clip_at_word(text: str, max_chars: int) -> str:
     return clipped or value[:max_chars]
 
 
-def _compact_step_label(text: str, max_chars: int = JEV_STEP_LABEL_CHARS) -> str:
-    """Turn a transcript utterance into a short flowchart node label."""
-    cleaned = " ".join(str(text).split())
-    section = _SECTION_HEADING_RE.search(cleaned)
-    if section:
-        heading = f"Section {section.group(1)}. {section.group(2).strip(' .,-')}"
-        return _clip_at_word(heading, max_chars)
-    first = re.split(r"(?<=[.!?])\s+", cleaned, maxsplit=1)[0]
-    first = re.sub(r"\s+(Yes|No|Cancelled)\b.*", "", first, flags=re.IGNORECASE).strip(" .")
-    return _clip_at_word(first or cleaned, max_chars)
-
-
-def _is_answered_status_check(text: str) -> bool:
-    """Return True when a question is already answered in the same utterance."""
-    return bool(_ANSWERED_STATUS_RE.search(text))
-
-
-def _is_process_branch(text: str, action_type: str) -> bool:
-    """Return True when the utterance is a real workflow fork, not a status Q&A."""
-    if _is_answered_status_check(text):
-        return False
-    if _PROCESS_BRANCH_RE.search(text):
-        return True
-    return action_type == "branch" and "?" in text and " if " in f" {text.lower()} "
-
-
-def _resolve_jev_lane(role_label: str, speaker: str) -> str:
-    """Prefer a named process role; otherwise keep the meeting speaker as the lane."""
-    speaker_name = str(speaker).strip() or "Participant"
-    if not role_label or role_label in JEV_FALLBACK_ROLES:
-        return speaker_name
-    return role_label
-
-
-def _role_key(name: str) -> str:
-    """Normalize a role or speaker name into a Jev choice id."""
-    key = re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
-    return key or "other"
-
-
-def _pretty_role(role_id: str) -> str:
-    """Return a display label for a swimlane role id."""
-    labels = {
-        "sales_representative": "Sales Representative",
-        "applicant": "Applicant",
-        "underwriting": "Underwriting",
-        "contracts": "Contracts",
-        "licensed_broker": "Licensed Broker",
-        "finance": "Finance",
-        "property_management": "Property Management",
-        "manager": "Manager",
-        "project_manager": "Project Manager",
-        "procurement": "Procurement",
-        "superintendent": "Superintendent",
-        "architect": "Architect",
-        "subcontractor": "Subcontractor",
-        "facilitator": "Facilitator",
-        "unassigned": "Unassigned",
-        "other": "Other",
-    }
-    if role_id in labels:
-        return labels[role_id]
-    return role_id.replace("_", " ").title() or "Unassigned"
-
-
-def _jev_generic_role_criteria() -> dict[str, str]:
-    """Return closed-set role options Jev can assign to a process step."""
-    return {
-        "sales_representative": "Sales or leasing representative who handles inquiries and tours",
-        "applicant": "Customer, tenant, applicant, or requester in the process",
-        "underwriting": "Credit screening, underwriting, or risk review",
-        "contracts": "Contracts, legal, or lease execution",
-        "licensed_broker": "Licensed broker responsible for statutory disclosures",
-        "finance": "Finance, payment, or deposit verification",
-        "property_management": "Property management, operations, or key handover",
-        "manager": "Manager or approver who signs off",
-        "project_manager": "Project manager running the status meeting or overall job",
-        "procurement": "Procurement, purchasing, POs, vendors, or buyout",
-        "superintendent": "Field superintendent or site supervisor",
-        "architect": "Architect, designer, or drawing author",
-        "subcontractor": "Trade subcontractor performing the work",
-        "facilitator": "Meeting facilitator who is not a process owner",
-        "unassigned": "No responsible role is named",
-        "other": "A different role than the listed options",
-    }
-
-
-def _jev_role_criteria(utterances: list[dict[str, Any]]) -> tuple[dict[str, str], dict[str, str]]:
-    """Build Jev role choices from generic lanes plus speakers in the transcript."""
-    generic = _jev_generic_role_criteria()
-    criteria = dict(generic)
-    labels = {key: _pretty_role(key) for key in criteria}
-    for utterance in utterances:
-        speaker = str(utterance.get("speaker") or "Participant").strip() or "Participant"
-        key = _role_key(speaker)
-        if key in generic:
-            continue
-        criteria[key] = f"The meeting speaker labeled {speaker}"
-        labels[key] = speaker
-    return criteria, labels
-
-
 def _format_transcript_line(timestamp: str | None, text: str) -> str:
     """Build a single timestamped transcript line, omitting empty speech."""
     cleaned = str(text).strip()
@@ -1366,39 +1236,6 @@ def normalize_pasted_transcript(transcript_text: str) -> str:
             lines.append(formatted)
         pending_timestamp = None
     return "\n".join(lines)
-
-
-def _strip_line_timestamps(line: str) -> str:
-    """Remove caption timestamps and duration labels from one transcript line."""
-    text = str(line).strip()
-    if not text:
-        return ""
-    if (
-        _SRT_RANGE_RE.match(text)
-        or _BARE_TIMESTAMP_RE.match(text)
-        or _YOUTUBE_DURATION_ONLY_RE.match(text)
-    ):
-        return ""
-    mashed = _YOUTUBE_MASHED_CAPTION_RE.match(text)
-    if mashed:
-        text = (mashed.group("text") or "").strip()
-    else:
-        text = _BRACKET_TIMESTAMP_RE.sub("", text).strip()
-        text = _LEADING_TIMESTAMP_RE.sub("", text).strip()
-        text = _YOUTUBE_DURATION_PREFIX_RE.sub("", text).strip()
-    return text
-
-
-def strip_transcript_timestamps(transcript_text: str) -> str:
-    """Return spoken transcript text with caption timestamps removed."""
-    raw = str(transcript_text or "").replace("\xa0", " ")
-    lines = [_strip_line_timestamps(line) for line in raw.splitlines()]
-    return "\n".join(line for line in lines if line)
-
-
-def _transcript_for_openrouter(transcript_text: str) -> str:
-    """Return transcript text safe to send to OpenRouter, without timestamps."""
-    return strip_transcript_timestamps(transcript_text)
 
 
 def _parse_transcript_utterances(transcript_text: str) -> list[dict[str, Any]]:
@@ -1522,17 +1359,6 @@ def apply_translated_utterance_annotations(
     return merged
 
 
-def _jev_action_criteria() -> dict[str, str]:
-    """Return workflow action choices for one utterance."""
-    return {
-        "add": "Adds or reviews a process step, agenda section, or status item",
-        "modify": "Corrects or reassigns an earlier process step",
-        "branch": "Creates two different next steps, such as approve vs reject. A status question that is answered in the same turn is not a branch",
-        "unclear": "Mentions a step but the owner or next action is missing",
-        "none": "No workflow step, including greetings and chit-chat",
-    }
-
-
 def _estimate_jev_tokens(value: Any) -> int:
     """Estimate Jev input tokens from serialized JSON size."""
     encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -1552,131 +1378,12 @@ def _jev_payload_fits(state: dict[str, Any], questions: dict[str, dict[str, Any]
     return total_tokens <= request_budget and state_plus_longest <= state_budget
 
 
-def _pack_jev_utterance_batches(
-    utterances: list[dict[str, Any]],
-    role_criteria: dict[str, str],
-    full_state: dict[str, Any],
-) -> list[list[dict[str, Any]]]:
-    """Pack utterances into the fewest Jev requests that fit the token budgets."""
-    if not utterances:
-        return []
-    all_questions = _build_jev_utterance_questions(utterances, role_criteria)
-    if _jev_payload_fits(full_state, all_questions):
-        return [utterances]
-
-    use_full_state = _jev_payload_fits(
-        full_state,
-        _build_jev_utterance_questions(utterances[:1], role_criteria),
-    )
-    batches: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    for utterance in utterances:
-        candidate = current + [utterance]
-        state = full_state if use_full_state else _jev_state(candidate)
-        questions = _build_jev_utterance_questions(candidate, role_criteria)
-        if current and not _jev_payload_fits(state, questions):
-            batches.append(current)
-            current = [utterance]
-        else:
-            current = candidate
-    if current:
-        batches.append(current)
-    return batches
-
-
 def _jev_error_is_token_overflow(error: BaseException) -> bool:
     """Return whether a Jev/OpenRouter error is a context or max-token overflow."""
     response = getattr(error, "response", None)
     detail = getattr(response, "text", "") if response is not None else ""
     combined = f"{detail} {error}".lower()
     return "max_tokens_exceeded" in combined or "context_length_exceeded" in combined
-
-
-def _ask_jev_utterance_batch(
-    api_key: str,
-    model: str,
-    full_state: dict[str, Any],
-    batch: list[dict[str, Any]],
-    role_criteria: dict[str, str],
-) -> dict[str, Any]:
-    """Send one utterance batch to Jev, shrinking or splitting if tokens overflow."""
-    questions = _build_jev_utterance_questions(batch, role_criteria)
-    state = full_state if _jev_payload_fits(full_state, questions) else _jev_state(batch)
-    try:
-        return _ask_jev_decisions(api_key, model, state, questions)
-    except requests.HTTPError as error:
-        if not _jev_error_is_token_overflow(error):
-            raise
-        if len(batch) > 1:
-            mid = max(1, len(batch) // 2)
-            answers = _ask_jev_utterance_batch(
-                api_key, model, full_state, batch[:mid], role_criteria
-            )
-            answers.update(
-                _ask_jev_utterance_batch(
-                    api_key, model, full_state, batch[mid:], role_criteria
-                )
-            )
-            return answers
-        local_state = _jev_state(batch)
-        if state is full_state:
-            return _ask_jev_decisions(api_key, model, local_state, questions)
-        raise
-
-
-def _build_jev_utterance_questions(
-    utterances: list[dict[str, Any]],
-    role_criteria: dict[str, str],
-) -> dict[str, dict[str, Any]]:
-    """Build Jev questions that classify a batch of transcript utterances."""
-    questions: dict[str, dict[str, Any]] = {}
-    action_criteria = _jev_action_criteria()
-    for utterance in utterances:
-        uid = f"u{utterance['id']}"
-        questions[f"{uid}_business"] = {
-            "type": "noul",
-            "instructions": (
-                f'For the utterance with id "{uid}": does this utterance describe a '
-                "business process step rather than greeting or chit-chat?"
-            ),
-            "criteria": {
-                "true": "Names a process step, role, approval, application, payment, or handover",
-                "false": "Greeting, joke, small talk, or no process content",
-            },
-        }
-        questions[f"{uid}_action"] = {
-            "type": "choice",
-            "instructions": (
-                f'For the utterance with id "{uid}": what workflow action does this utterance represent?'
-            ),
-            "criteria": action_criteria,
-        }
-        questions[f"{uid}_role"] = {
-            "type": "choice",
-            "instructions": (
-                f'For the utterance with id "{uid}": which role owns the process step being described?'
-            ),
-            "criteria": role_criteria,
-        }
-    return questions
-
-
-def _jev_state(utterances: list[dict[str, Any]]) -> dict[str, Any]:
-    """Build the Decisions API state payload for a meeting transcript."""
-    return {
-        "description": "A meeting transcript split into numbered utterances.",
-        "utterances": [
-            {
-                "id": f"u{utterance['id']}",
-                "speaker": utterance["speaker"],
-                "text": _clip_text(
-                    _transcript_for_openrouter(str(utterance.get("text") or "")),
-                    JEV_UTTERANCE_TEXT_CHARS,
-                ),
-            }
-            for utterance in utterances
-        ],
-    }
 
 
 def _jev_headers(api_key: str) -> dict[str, str]:
@@ -1727,124 +1434,6 @@ def _noul_value(answer: Any) -> float:
     if not isinstance(answer, dict):
         return 0.0
     return float(answer.get("noul", 0.0) or 0.0)
-
-
-def _classify_utterances_with_jev(
-    utterances: list[dict[str, Any]],
-    api_key: str,
-    model: str,
-) -> list[dict[str, Any]]:
-    """Classify each utterance with Jev and return labeled utterances."""
-    role_criteria, role_labels = _jev_role_criteria(utterances)
-    state = _jev_state(utterances)
-    answers: dict[str, Any] = {}
-    for batch in _pack_jev_utterance_batches(utterances, role_criteria, state):
-        answers.update(
-            _ask_jev_utterance_batch(api_key, model, state, batch, role_criteria)
-        )
-
-    classified: list[dict[str, Any]] = []
-    for utterance in utterances:
-        uid = f"u{utterance['id']}"
-        relevance = _noul_value(answers.get(f"{uid}_business"))
-        is_business = relevance >= JEV_BUSINESS_THRESHOLD
-        action_type = _choice_value(answers.get(f"{uid}_action"), "none")[0]
-        if action_type not in _jev_action_criteria():
-            action_type = "none"
-        if not is_business:
-            action_type = "none"
-        elif action_type == "branch" and _is_answered_status_check(utterance["text"]):
-            action_type = "add"
-        role_id, role_confidence = _choice_value(answers.get(f"{uid}_role"), "unassigned")
-        role_label = _resolve_jev_lane(
-            role_labels.get(role_id, _pretty_role(role_id)),
-            str(utterance.get("speaker") or "Participant"),
-        )
-        step_label = _compact_step_label(utterance["text"])
-        classified.append(
-            {
-                **utterance,
-                "is_business": is_business,
-                "relevance_score": round(relevance, 2),
-                "action_type": action_type,
-                "detected_step": step_label if is_business and action_type != "none" else None,
-                "detected_role": role_label if is_business and action_type != "none" else None,
-                "role_confidence": role_confidence,
-            }
-        )
-    return classified
-
-
-def _jev_node_type(label: str, action_type: str) -> str:
-    """Map an utterance onto a flowchart node type."""
-    if _is_process_branch(label, action_type):
-        return "decision"
-    return "action"
-
-
-def _workflow_from_jev_utterances(utterances: list[dict[str, Any]]) -> dict[str, Any]:
-    """Assemble lanes, nodes, edges, and confirmations from classified utterances."""
-    step_utterances = [
-        utterance
-        for utterance in utterances
-        if utterance.get("is_business") and utterance.get("action_type") != "none"
-    ]
-    nodes: list[dict[str, Any]] = []
-    edges: list[dict[str, Any]] = []
-    lanes: list[str] = []
-    confirmations: list[dict[str, Any]] = []
-    if not step_utterances:
-        return {
-            "nodes": nodes,
-            "edges": edges,
-            "lanes": lanes,
-            "confirmations": confirmations,
-        }
-
-    def _add_lane(lane: str) -> None:
-        if lane not in lanes:
-            lanes.append(lane)
-
-    first_lane = str(step_utterances[0].get("detected_role") or "Unassigned")
-    last_lane = str(step_utterances[-1].get("detected_role") or first_lane)
-    _add_lane(first_lane)
-    nodes.append({"id": "N1", "lane": first_lane, "label": "Start", "node_type": "start"})
-    previous_id = "N1"
-    for index, utterance in enumerate(step_utterances):
-        node_id = f"N{index + 2}"
-        lane = str(utterance.get("detected_role") or "Unassigned")
-        _add_lane(lane)
-        label = str(utterance.get("detected_step") or _compact_step_label(utterance["text"]))
-        nodes.append(
-            {
-                "id": node_id,
-                "lane": lane,
-                "label": label,
-                "node_type": _jev_node_type(f"{label} {utterance.get('text', '')}", str(utterance.get("action_type") or "add")),
-            }
-        )
-        edges.append({"source": previous_id, "target": node_id, "label": None})
-        previous_id = node_id
-        if utterance.get("action_type") == "unclear":
-            confirmations.append(
-                {
-                    "id": len(confirmations) + 1,
-                    "question": f"Who is responsible for '{label}'?",
-                    "suggested_role": lane,
-                    "confidence": round(float(utterance.get("role_confidence", 0.65) or 0.65), 2),
-                    "source_ids": [f"U{utterance.get('id')}"] if utterance.get("id") else [],
-                }
-            )
-    end_id = f"N{len(step_utterances) + 2}"
-    _add_lane(last_lane)
-    nodes.append({"id": end_id, "lane": last_lane, "label": "Complete", "node_type": "end"})
-    edges.append({"source": previous_id, "target": end_id, "label": None})
-    return {
-        "nodes": nodes,
-        "edges": edges,
-        "lanes": lanes,
-        "confirmations": confirmations,
-    }
 
 
 def _node_lookup(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

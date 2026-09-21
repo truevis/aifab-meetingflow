@@ -72,15 +72,6 @@ def _display_text(value: Any) -> str:
     return str(value).replace("$", "＄")
 
 
-def _is_non_english(data: dict[str, Any]) -> bool:
-    """Check if the current meeting contains non-English text that needs translation."""
-    utterances = data.get("utterances", [])
-    lanes = data.get("lanes", [])
-    sample_text = " ".join([u.get("text", "") for u in utterances] + lanes)
-    # Check for presence of Japanese/CJK characters
-    return any(ord(char) > 0x2E80 for char in sample_text)
-
-
 def _transcript_from_meeting(meeting_data: dict[str, Any]) -> str:
     """Build transcript textarea text from cached meeting utterances."""
     return "\n".join(
