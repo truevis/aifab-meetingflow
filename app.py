@@ -99,6 +99,8 @@ def _empty_meeting_data() -> dict[str, Any]:
         "confirmations": [],
         "alternatives": [],
         "facts": [],
+        "side_notes": [],
+        "uncited_excerpts": [],
         "cache_fingerprint": "",
     }
 
@@ -127,6 +129,14 @@ def _expected_cache_fingerprint(engine: str) -> str:
 def _engine_display_name(engine: str) -> str:
     """Return the human-readable name of the selected flowchart engine."""
     return ENGINE_LABELS.get(engine, engine)
+
+
+def _create_flowchart_button_label(engine: str, translate_to_english: bool = False) -> str:
+    """Return the single primary create-flowchart button label."""
+    engine_label = _engine_display_name(engine)
+    if translate_to_english:
+        return f"Translate & create flowchart with {engine_label}"
+    return f"Create flowchart with {engine_label}"
 
 
 def _engine_has_result(engine: str) -> bool:
@@ -190,6 +200,8 @@ def _reset_to_sample_meeting() -> None:
     for sample_engine, meeting in st.session_state.meeting_by_engine.items():
         meeting["alternatives"] = list(meeting.get("alternatives") or [])
         meeting["facts"] = list(meeting.get("facts") or [])
+        meeting["side_notes"] = list(meeting.get("side_notes") or [])
+        meeting["uncited_excerpts"] = list(meeting.get("uncited_excerpts") or [])
         meeting["cache_fingerprint"] = workflow_cache_fingerprint(
             st.session_state.transcript_input,
             sample_engine,
@@ -234,25 +246,13 @@ def _initialize_state() -> None:
 
 
 def _render_header() -> None:
-    """Render top brand and high-level summary metrics."""
+    """Render top brand and product caption."""
     st.title("🎯 Meeting Flow Live")
     st.caption(
         "Automatically extract and generate interactive Markdown flowcharts (Mermaid format) "
         "from meeting audio, video, or transcripts. Filters out chit-chat, assigns department swimlanes, "
         "tracks decision branches, and flags ambiguous action items in American English."
     )
-
-
-def _render_summary_metrics(meeting_data: dict[str, Any]) -> None:
-    """Render high-level metrics for steps, lanes, and confirmation items."""
-    nodes = meeting_data.get("nodes", [])
-    lanes = meeting_data.get("lanes", [])
-    confirmations = meeting_data.get("confirmations", [])
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Steps", len(nodes))
-    col2.metric("Identified Swimlanes", len(lanes))
-    col3.metric("Action Items to Confirm", len(confirmations))
 
 
 def _source_timestamp_lookup(utterances: list[dict[str, Any]]) -> dict[str, str]:
@@ -374,67 +374,83 @@ def _mermaid_for_display(mermaid_code: str) -> str:
     return mermaid_code.replace("$", "＄")
 
 
+def _flowchart_side_notes(meeting_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return chart side notes from the payload, falling back to alternatives and facts."""
+    notes = meeting_data.get("side_notes")
+    if isinstance(notes, list) and notes:
+        return [note for note in notes if isinstance(note, (dict, str))]
+    built: list[dict[str, Any]] = []
+    for item in meeting_data.get("alternatives") or []:
+        if isinstance(item, str) and item.strip():
+            built.append({"label": item.strip(), "kind": "alternative"})
+        elif isinstance(item, dict):
+            label = str(item.get("label") or item.get("text") or "").strip()
+            if label:
+                built.append({"label": label, "kind": "alternative"})
+    for item in meeting_data.get("facts") or []:
+        if isinstance(item, str) and item.strip():
+            built.append({"label": item.strip(), "kind": "fact"})
+        elif isinstance(item, dict):
+            label = str(item.get("text") or item.get("label") or "").strip()
+            if label:
+                built.append({"label": label, "kind": "fact"})
+    return built
+
+
+def _build_meeting_mermaid(meeting_data: dict[str, Any]) -> str:
+    """Build Mermaid markdown for the meeting graph and side notes."""
+    return build_mermaid_flowchart(
+        meeting_data.get("nodes") or [],
+        meeting_data.get("edges") or [],
+        lanes=meeting_data.get("lanes") or [],
+        direction="TD",
+        side_notes=_flowchart_side_notes(meeting_data),
+    )
+
+
+def _render_uncited_excerpts(excerpts: list[Any]) -> None:
+    """Show overflow original-text coverage under the chart."""
+    lines: list[str] = []
+    for item in excerpts:
+        if isinstance(item, str) and item.strip():
+            lines.append(item.strip())
+        elif isinstance(item, dict):
+            text = str(item.get("text") or item.get("label") or "").strip()
+            if text:
+                lines.append(text)
+    if not lines:
+        return
+    with st.expander("Additional discussed text (original wording)"):
+        for line in lines:
+            st.caption(_display_text(line))
+
+
 def _render_flowchart_view(meeting_data: dict[str, Any]) -> None:
     """Render the Markdown Mermaid flowchart and raw code copy."""
     nodes = meeting_data.get("nodes", [])
-    edges = meeting_data.get("edges", [])
-    lanes = meeting_data.get("lanes", [])
+    side_notes = _flowchart_side_notes(meeting_data)
+    has_chart = bool(nodes) or bool(side_notes)
     empty_caption = (
         "No flowchart yet. Upload a meeting, import a transcript file, "
         "paste a transcript, or load the sample."
     )
-    if _engine_has_result(_selected_flowchart_engine()) and not nodes:
+    if _engine_has_result(_selected_flowchart_engine()) and not has_chart:
         empty_caption = "No supported workflow found"
 
     tab1, tab2, tab3 = st.tabs(["📊 Flowchart Diagram", "📋 Step Table", "📝 Markdown Source"])
 
     with tab1:
-        timestamps = _source_timestamp_lookup(meeting_data.get("utterances") or [])
         warnings = meeting_data.get("validation_warnings") or []
         if warnings:
             for warning in warnings:
                 st.caption(_display_text(warning))
-        alternatives = meeting_data.get("alternatives") or []
-        if alternatives:
-            labels = []
-            for item in alternatives:
-                if isinstance(item, str) and item.strip():
-                    labels.append(item.strip())
-                elif isinstance(item, dict):
-                    label = str(item.get("label") or item.get("text") or "").strip()
-                    sources = _format_source_citations(item.get("source_ids"), timestamps)
-                    if label and sources:
-                        labels.append(f"{label} ({sources})")
-                    elif label:
-                        labels.append(label)
-            if labels:
-                st.info(
-                    "Alternatives not on the main path: "
-                    + "; ".join(_display_text(label) for label in labels)
-                )
-        facts = meeting_data.get("facts") or []
-        if facts:
-            fact_lines = []
-            for item in facts:
-                if isinstance(item, str) and item.strip():
-                    fact_lines.append(item.strip())
-                elif isinstance(item, dict):
-                    text = str(item.get("text") or item.get("label") or "").strip()
-                    sources = _format_source_citations(item.get("source_ids"), timestamps)
-                    if text and sources:
-                        fact_lines.append(f"{text} ({sources})")
-                    elif text:
-                        fact_lines.append(text)
-            if fact_lines:
-                st.info(
-                    "Facts: " + "; ".join(_display_text(line) for line in fact_lines)
-                )
-        if not nodes:
+        if not has_chart:
             st.caption(empty_caption)
         else:
-            mermaid_code = build_mermaid_flowchart(nodes, edges, lanes=lanes, direction="TD")
+            mermaid_code = _build_meeting_mermaid(meeting_data)
             st.caption("Markdown Mermaid Flowchart Preview:")
             st.mermaid_chart(_mermaid_for_display(mermaid_code), width="stretch")
+            _render_uncited_excerpts(meeting_data.get("uncited_excerpts") or [])
 
     with tab2:
         st.caption("Flowchart nodes and assigned department swimlanes:")
@@ -445,10 +461,10 @@ def _render_flowchart_view(meeting_data: dict[str, Any]) -> None:
         )
 
     with tab3:
-        if not nodes:
+        if not has_chart:
             st.caption(empty_caption)
         else:
-            mermaid_code = build_mermaid_flowchart(nodes, edges, lanes=lanes, direction="TD")
+            mermaid_code = _build_meeting_mermaid(meeting_data)
             st.caption("Copyable Markdown Mermaid code:")
             st.code(mermaid_code, language="mermaid")
             st.download_button(
@@ -459,8 +475,8 @@ def _render_flowchart_view(meeting_data: dict[str, Any]) -> None:
             )
 
 
-def _render_sidebar() -> tuple[str, str, bool, bool]:
-    """Render sidebar decision controls and return VL model, engine, translate, and create-click."""
+def _render_sidebar() -> tuple[str, str, bool]:
+    """Render sidebar decision controls and return VL model, engine, and translate."""
     models = get_vl_transcription_models()
     model_ids = [model["id"] for model in models]
     labels_by_id = {model["id"]: model["label"] for model in models}
@@ -489,20 +505,14 @@ def _render_sidebar() -> tuple[str, str, bool, bool]:
         options=list(FLOWCHART_ENGINES),
         format_func=_engine_display_name,
         key="flowchart_engine",
-        help="Used to extract a Mermaid flowchart from the meeting transcript. Jev hybrid: Mercury synthesizes the graph and Jev checks supported relationships. Switching shows that model's cached flowchart if one exists.",
+        help="Used to extract a Mermaid flowchart from the meeting transcript. Jev hybrid: Mercury synthesizes the graph, Jev checks cited claims, and Jev can recover unused alternatives the synthesizer omitted. Switching shows that model's cached flowchart if one exists.",
     )
     engine_label = _engine_display_name(engine)
-    create_clicked = st.sidebar.button(
-        f"Create flowchart with {engine_label}",
-        type="primary",
-        use_container_width=True,
-        help="Runs only the currently selected flowchart model on the meeting transcript.",
-    )
     if not _engine_has_result(engine):
         st.sidebar.caption(
-            f"No {engine_label} flowchart yet. Click the button above to generate it."
+            f"No {engine_label} flowchart yet. Click {_create_flowchart_button_label(engine)} to generate it."
         )
-    return selected_model, engine, translate_to_english, create_clicked
+    return selected_model, engine, translate_to_english
 
 
 def _read_uploaded_media(uploaded_file: Any) -> tuple[bytes, str]:
@@ -603,6 +613,8 @@ def _store_engine_analysis(
     meeting["confirmations"] = analyzed.get("confirmations", [])
     meeting["alternatives"] = analyzed.get("alternatives", [])
     meeting["facts"] = analyzed.get("facts", [])
+    meeting["side_notes"] = analyzed.get("side_notes", [])
+    meeting["uncited_excerpts"] = analyzed.get("uncited_excerpts", [])
     meeting["validation_warnings"] = analyzed.get("validation_warnings", [])
     source_utterances = _parse_transcript_utterances(transcript_text)
     model_utterances = analyzed.get("utterances")
@@ -848,6 +860,19 @@ def _gather_meeting_transcript(
     return normalize_pasted_transcript(str(transcript_text or "").strip())
 
 
+def _uploaded_media_to_transcribe(
+    uploaded_file: Any,
+    transcript_text: str,
+    paste_source: bool,
+) -> Any:
+    """Return uploaded media when the transcript box is empty; otherwise reuse the text."""
+    if paste_source or uploaded_file is None:
+        return None
+    if str(transcript_text or "").strip():
+        return None
+    return uploaded_file
+
+
 def _handle_run_analysis(
     transcript_text: str,
     api_key: str,
@@ -1028,21 +1053,24 @@ def _render_meeting_file_uploader(paste_source: bool) -> Any:
 
 
 def _render_input_controls(engine: str, translate_to_english: bool) -> tuple[str, bool, Any, Any, bool]:
-    """Render meeting source, sample loader, extract button, and transcript input."""
+    """Render meeting source, sample loader, create-flowchart button, and transcript input."""
     paste_source = _render_meeting_source_selector() == SOURCE_PASTE
     uploaded_video = _render_meeting_file_uploader(paste_source)
 
-    engine_label = _engine_display_name(engine)
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         load_sample = st.button("Load sample transcript and flowchart", use_container_width=True)
     with col_btn2:
-        button_label = (
-            f"🚀 Translate & Extract Workflow ({engine_label})"
-            if translate_to_english
-            else f"🚀 Extract Workflow Diagram ({engine_label})"
+        run_llm = st.button(
+            _create_flowchart_button_label(engine, translate_to_english),
+            type="primary",
+            use_container_width=True,
+            help=(
+                "Uses the Meeting Transcript text if it is already complete. "
+                "If that box is empty and a video or audio file is uploaded, "
+                "transcribes first, then creates the flowchart with the selected model."
+            ),
         )
-        run_llm = st.button(button_label, type="primary", use_container_width=True)
 
     if load_sample:
         _reset_to_sample_meeting()
@@ -1059,12 +1087,9 @@ def main() -> None:
         layout="wide",
     )
     _initialize_state()
-    vl_model, engine, translate_to_english, create_clicked = _render_sidebar()
+    vl_model, engine, translate_to_english = _render_sidebar()
     _sync_current_meeting_from_engine(engine)
     _render_header()
-
-    meeting_data = _meeting_for_display(engine)
-    _render_summary_metrics(meeting_data)
 
     left_col, right_col = st.columns([1, 2], gap="medium")
 
@@ -1075,13 +1100,13 @@ def main() -> None:
                 translate_to_english,
             )
         )
-        if create_clicked or run_llm_clicked:
+        if run_llm_clicked:
             api_key = get_openrouter_api_key()
-            media_for_transcript = None
-            if not paste_source:
-                media_for_transcript = uploaded_file if run_llm_clicked else None
-                if media_for_transcript is None and not str(transcript_text or "").strip():
-                    media_for_transcript = uploaded_file
+            media_for_transcript = _uploaded_media_to_transcribe(
+                uploaded_file,
+                transcript_text,
+                paste_source,
+            )
             _handle_run_analysis(
                 transcript_text,
                 api_key,
@@ -1106,7 +1131,7 @@ def main() -> None:
         elif not _engine_has_result(engine):
             st.caption(
                 f"No {_engine_display_name(engine)} flowchart yet. "
-                f"Click Create flowchart with {_engine_display_name(engine)} in the sidebar to generate it."
+                f"Click {_create_flowchart_button_label(engine)} to generate it."
             )
         _render_flowchart_view(_meeting_for_display(engine))
 

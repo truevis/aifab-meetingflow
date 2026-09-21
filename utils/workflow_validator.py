@@ -175,7 +175,7 @@ def _collect_semantic_warnings(
             queue.extend(undirected.get(current, ()))
     if component_count > 1:
         warnings.append(
-            f"Graph has {component_count} disconnected components; confirm they are separate processes."
+            f"The transcript did not connect these {component_count} processes."
         )
     return warnings
 

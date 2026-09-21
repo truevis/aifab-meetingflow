@@ -11,6 +11,7 @@ from typing import Any, Iterator
 
 import requests
 
+from utils.flowchart_generator import SIDE_BLOB_CAP
 from utils.workflow_validator import (
     normalize_incomplete_decisions,
     validate_workflow_graph,
@@ -33,11 +34,16 @@ JEV_BUSINESS_THRESHOLD = 0.5
 JEV_UTTERANCE_TEXT_CHARS = 400
 JEV_STEP_LABEL_CHARS = 48
 JEV_FALLBACK_ROLES = {"Unassigned", "Other", "Facilitator"}
-WORKFLOW_SCHEMA_REVISION = "3"
+WORKFLOW_SCHEMA_REVISION = "5"
 # TypeSafe: 64k for state + all questions; 32k for state + the longest question.
 JEV_REQUEST_TOKEN_LIMIT = 64_000
 JEV_STATE_PLUS_QUESTION_TOKEN_LIMIT = 32_000
 JEV_TOKEN_HEADROOM = 0.85
+JEV_AUTO_ACCEPT = 0.8
+JEV_NOUL_UNCERTAIN_LOW = 0.4
+JEV_NOUL_UNCERTAIN_HIGH = 0.6
+JEV_ALT_LABEL_CHARS = 120
+JEV_CLAIM_EXCERPT_CHARS = 160
 
 _TIMESTAMPED_UTTERANCE_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s*(?:(?P<speaker>[^:]{1,80}):\s*)?(?P<text>.*)$"
@@ -79,6 +85,19 @@ _ANSWERED_STATUS_RE = re.compile(
 )
 _PROCESS_BRANCH_RE = re.compile(
     r"\b(if |unless |otherwise|rejected|approved vs|passed\?|failed)\b",
+    re.IGNORECASE,
+)
+_JEV_DAY_COUNT_RE = re.compile(
+    r"\b(\d{1,3})\s*(?:[-–/]\s*(\d{1,3}))?\s*[-–]?\s*days?(?:\s+(?:rule|wait|period))?\b",
+    re.IGNORECASE,
+)
+_JEV_COMPLETED_RE = re.compile(
+    r"\b(concluded|seated|completed|complete|held|done|finished)\b",
+    re.IGNORECASE,
+)
+_UNUSED_ALT_TOKEN_RE = re.compile(
+    r"\bpetition\b|\bappoint(?:ment)?\b|\binstead\b|\brather than\b|"
+    r"\balternative\b|\bor we could\b|\banother option\b",
     re.IGNORECASE,
 )
 
@@ -338,11 +357,17 @@ WORKFLOW LOGIC RULES:
   Business relevance alone does not make a statement a workflow step.
 - Show the stated intended process. Do not imply formal approval or completed
   work when speakers only express an intention.
+- Place each claim in exactly one place: a main-path step, a separate
+  disconnected process component, an alternative, a fact, or a confirmation.
+  Do not repeat the same claim across those fields.
 - Keep alternatives not adopted out of the main execution path. If their
   status is unresolved and affects the process, ask a confirmation question.
 - Do not model a choice speakers already resolved as a decision on the main
   path. Unused options (appointment, petition, skipped notices) stay in
   alternatives, not as execution branches.
+- Do not connect unrelated agenda items into one procedure. Leave separate
+  topics as disconnected components with no invented bridge edges.
+- Status updates are not new process steps.
 - Apply explicit corrections to the earlier step instead of appending a
   correction action. Do not treat every later disagreement as a correction.
 - Order steps by supported prerequisites, not the order of utterances.
@@ -353,9 +378,12 @@ WORKFLOW LOGIC RULES:
 - Assign the role performing the action, not automatically the speaker.
   Use Unassigned and a confirmation when the responsible role is unknown.
 - Write complete, concise verb-object labels; preserve negation and conditions.
+- Never invent actors, deadlines, quantities, or completed outcomes the
+  speakers did not state.
 - Never put a contested quantity or deadline into a node or edge label.
   Put competing numbers in a confirmation with both source_ids and the
   reference event (vacancy vs resignation vs warn vs meeting).
+  Edge conditions must not assert a day count while timing remains disputed.
 - Preserve disputed quantities and deadlines in confirmation questions,
   including what event each deadline is measured from. Do not choose a value.
 - Describe future events as planned. Do not add a completed or end node for
@@ -767,10 +795,206 @@ def _known_source_ids(segments: list[dict[str, str]]) -> set[str]:
 
 def _ensure_workflow_lists(payload: dict[str, Any]) -> dict[str, Any]:
     """Fill missing graph list fields so validation can run."""
-    for key in ("nodes", "edges", "lanes", "confirmations", "alternatives", "facts"):
+    for key in (
+        "nodes",
+        "edges",
+        "lanes",
+        "confirmations",
+        "alternatives",
+        "facts",
+        "side_notes",
+        "uncited_excerpts",
+    ):
         if not isinstance(payload.get(key), list):
             payload[key] = []
     return payload
+
+
+def _payload_cited_source_ids(payload: dict[str, Any]) -> set[str]:
+    """Collect source_ids already cited by graph and side fields."""
+    cited: set[str] = set()
+    for kind in ("nodes", "edges", "alternatives", "facts", "confirmations"):
+        items = payload.get(kind)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for source_id in item.get("source_ids") or []:
+                text = str(source_id).strip()
+                if text:
+                    cited.add(text)
+    return cited
+
+
+def _utterance_by_source_id(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Map U12-style ids to utterance annotations on the payload."""
+    lookup: dict[str, dict[str, Any]] = {}
+    utterances = payload.get("utterances")
+    if not isinstance(utterances, list):
+        return lookup
+    for item in utterances:
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get("id")
+        if isinstance(raw_id, int):
+            source_id = f"U{raw_id}"
+        else:
+            text = str(raw_id or "").strip()
+            if text.upper().startswith("U") and text[1:].isdigit():
+                source_id = f"U{text[1:]}"
+            elif text.isdigit():
+                source_id = f"U{text}"
+            else:
+                continue
+        lookup[source_id] = item
+    return lookup
+
+
+def _is_business_utterance(utterance: dict[str, Any] | None) -> bool:
+    """Return whether an utterance annotation is business process talk."""
+    if not isinstance(utterance, dict):
+        return False
+    if not bool(utterance.get("is_business")):
+        return False
+    action_type = str(utterance.get("action_type") or "none").strip().casefold()
+    return action_type != "none"
+
+
+def _note_from_segment_run(run: list[dict[str, str]]) -> dict[str, Any]:
+    """Build an original-text side note from adjacent uncited segments."""
+    texts = [str(item.get("text") or "").strip() for item in run]
+    texts = [text for text in texts if text]
+    source_ids = [
+        str(item.get("source_id") or "").strip()
+        for item in run
+        if str(item.get("source_id") or "").strip()
+    ]
+    return {
+        "label": " ".join(texts),
+        "text": " ".join(texts),
+        "source_ids": source_ids,
+        "kind": "uncited",
+    }
+
+
+def _collect_uncited_business_notes(
+    payload: dict[str, Any],
+    segments: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    """Turn adjacent uncited business segments into original-text side notes."""
+    cited = _payload_cited_source_ids(payload)
+    utterances = _utterance_by_source_id(payload)
+    notes: list[dict[str, Any]] = []
+    current_run: list[dict[str, str]] = []
+    for segment in segments:
+        source_id = str(segment.get("source_id") or "").strip()
+        if not source_id:
+            continue
+        if source_id in cited or not _is_business_utterance(utterances.get(source_id)):
+            if current_run:
+                notes.append(_note_from_segment_run(current_run))
+                current_run = []
+            continue
+        current_run.append(segment)
+    if current_run:
+        notes.append(_note_from_segment_run(current_run))
+    return notes
+
+
+def _side_note_from_item(item: Any, kind: str) -> dict[str, Any] | None:
+    """Normalize an alternative or fact into a side-note dict."""
+    if isinstance(item, str):
+        label = item.strip()
+        if not label:
+            return None
+        return {"label": label, "text": label, "source_ids": [], "kind": kind}
+    if not isinstance(item, dict):
+        return None
+    label = str(item.get("label") or item.get("text") or "").strip()
+    if not label:
+        return None
+    source_ids = [
+        str(source_id).strip()
+        for source_id in (item.get("source_ids") or [])
+        if str(source_id).strip()
+    ]
+    return {
+        "label": label,
+        "text": str(item.get("text") or label).strip(),
+        "source_ids": source_ids,
+        "kind": kind,
+    }
+
+
+def _fill_side_notes_and_excerpts(
+    payload: dict[str, Any],
+    segments: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Build in-chart side notes and overflow original-text excerpts."""
+    side_notes: list[dict[str, Any]] = []
+    for item in payload.get("alternatives") or []:
+        note = _side_note_from_item(item, "alternative")
+        if note:
+            side_notes.append(note)
+    for item in payload.get("facts") or []:
+        note = _side_note_from_item(item, "fact")
+        if note:
+            side_notes.append(note)
+    side_notes.extend(_collect_uncited_business_notes(payload, segments))
+    payload["side_notes"] = side_notes[:SIDE_BLOB_CAP]
+    payload["uncited_excerpts"] = side_notes[SIDE_BLOB_CAP:]
+    return payload
+
+
+def _confirmation_disputes_timing(payload: dict[str, Any]) -> bool:
+    """Return whether confirmations still treat timing or notice windows as open."""
+    parts: list[str] = []
+    for item in payload.get("confirmations") or []:
+        if isinstance(item, dict):
+            parts.append(str(item.get("question") or ""))
+        elif isinstance(item, str):
+            parts.append(item)
+    blob = " ".join(parts).casefold()
+    return any(token in blob for token in ("days", "timing", "deadline", "notice", "warn"))
+
+
+def _strip_disputed_day_counts_from_graph(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove contested day counts from node and edge labels when timing is unresolved."""
+    if not _confirmation_disputes_timing(payload):
+        return payload
+    for node in payload.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        label = str(node.get("label") or "")
+        if not _has_day_count(label):
+            continue
+        stripped = _strip_day_counts(label)
+        if stripped:
+            node["label"] = stripped
+    for edge in payload.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        label = edge.get("label")
+        if not isinstance(label, str) or not _has_day_count(label):
+            continue
+        stripped = _strip_day_counts(label)
+        edge["label"] = stripped or None
+    return payload
+
+
+def _finalize_workflow_payload(
+    payload: dict[str, Any],
+    segments: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Normalize incomplete decisions, validate, then fill original-text coverage."""
+    _ensure_workflow_lists(payload)
+    normalize_incomplete_decisions(payload)
+    _strip_disputed_day_counts_from_graph(payload)
+    validated = validate_workflow_graph(
+        payload, known_source_ids=_known_source_ids(segments)
+    )
+    return _fill_side_notes_and_excerpts(validated, segments)
 
 
 def _parse_workflow_json_content(content: Any) -> dict[str, Any]:
@@ -879,16 +1103,6 @@ def _relevant_source_segments(
         return segments
     selected = [item for item in segments if item.get("source_id") in cited]
     return selected or segments
-
-
-def _finalize_workflow_payload(
-    payload: dict[str, Any],
-    segments: list[dict[str, str]],
-) -> dict[str, Any]:
-    """Normalize incomplete decisions and validate graph structure and evidence IDs."""
-    _ensure_workflow_lists(payload)
-    normalize_incomplete_decisions(payload)
-    return validate_workflow_graph(payload, known_source_ids=_known_source_ids(segments))
 
 
 def _repair_workflow_payload(
@@ -1642,78 +1856,328 @@ def _node_lookup(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     }
 
 
-def _jev_graph_check_state(
-    segments: list[dict[str, str]],
-    payload: dict[str, Any],
-) -> dict[str, Any]:
-    """Build Decisions state for bounded edge and owner checks."""
+def _jev_citation_criteria() -> dict[str, str]:
+    """Return citation-check choices from the TypeSafe cookbook."""
     return {
-        "description": (
-            "Source segments and a candidate workflow. Answer only whether each "
-            "proposed edge is supported and whether Unassigned ownership is actually unknown."
-        ),
-        "segments": segments,
-        "nodes": [
-            {
-                "id": node.get("id"),
-                "label": node.get("label"),
-                "lane": node.get("lane"),
-                "node_type": node.get("node_type"),
-            }
-            for node in payload.get("nodes") or []
-            if isinstance(node, dict)
-        ],
-        "edges": [
-            {
-                "source": edge.get("source"),
-                "target": edge.get("target"),
-                "label": edge.get("label"),
-            }
-            for edge in payload.get("edges") or []
-            if isinstance(edge, dict)
-        ],
+        "supports": "The cited segments state the claim or directly imply that it is true",
+        "contradicts": "The cited segments state the opposite of the claim or imply it is false",
+        "says_nothing": "The cited segments do not address what the claim asserts, either way",
     }
 
 
-def _jev_graph_check_questions(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Build yes/no Jev questions for proposed edges and Unassigned owners."""
-    questions: dict[str, dict[str, Any]] = {}
+def _jev_decision_kind_criteria() -> dict[str, str]:
+    """Return choices for whether a diamond is still an open choice."""
+    return {
+        "open_choice": "Speakers still face two or more live options",
+        "one_adopted": "Speakers adopted one option and left the other unused",
+        "not_a_choice": "This is not a live choice in the transcript",
+    }
+
+
+def _jev_unused_alternative_criteria() -> dict[str, str]:
+    """Return choices for a shortlisted unused-alternative segment."""
+    return {
+        "unused_alternative": (
+            "A process option that was proposed but not adopted as the main path, "
+            "including a voter petition or appointment the speakers did not take"
+        ),
+        "adopted_step": "A step the speakers adopted or are proceeding with",
+        "background": "Context, history, or explanation, not a distinct unused option",
+        "unrelated": "Not a process option or step",
+    }
+
+
+def _has_day_count(text: str) -> bool:
+    """Return whether text asserts a day-count quantity."""
+    return bool(_JEV_DAY_COUNT_RE.search(text or ""))
+
+
+def _looks_completed(text: str) -> bool:
+    """Return whether text describes a finished result."""
+    return bool(_JEV_COMPLETED_RE.search(text or ""))
+
+
+def _strip_day_counts(label: str) -> str:
+    """Remove day-count phrases from a label without inventing replacement wording."""
+    cleaned = _JEV_DAY_COUNT_RE.sub("", str(label or ""))
+    cleaned = re.sub(r"\(\s*(?:rule|wait|period)?\s*\)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\[\s*(?:rule|wait|period)?\s*\]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"\[\s*\]", "", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+    cleaned = cleaned.strip(" \t-–/,:;")
+    cleaned = re.sub(
+        r"\b(at least|not less than|no more than|within|prior to|ahead of)\s*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned.strip(" \t-–/,:;")
+
+
+def _claim_excerpts(
+    source_ids: list[str],
+    segments: list[dict[str, str]],
+    max_chars: int = JEV_CLAIM_EXCERPT_CHARS,
+) -> list[dict[str, str]]:
+    """Build cited excerpts for a claim's question instructions."""
+    texts = {
+        str(item.get("source_id") or ""): str(item.get("text") or "")
+        for item in segments
+        if str(item.get("source_id") or "")
+    }
+    excerpts: list[dict[str, str]] = []
+    for source_id in source_ids:
+        excerpts.append(
+            {
+                "source_id": source_id,
+                "text": _clip_text(texts.get(source_id, ""), max_chars),
+            }
+        )
+    return excerpts
+
+
+def _edge_claim_text(
+    source: dict[str, Any],
+    target: dict[str, Any],
+    edge: dict[str, Any],
+) -> str:
+    """Build an edge claim from node labels plus any edge condition."""
+    source_label = str(source.get("label") or edge.get("source") or "")
+    target_label = str(target.get("label") or edge.get("target") or "")
+    text = f"{source_label} leads to {target_label}"
+    edge_label = str(edge.get("label") or "").strip()
+    if edge_label:
+        text = f"{text} ({edge_label})"
+    return text
+
+
+def _collect_jev_claims(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect code-built claims from Mercury edges, nodes, alternatives, and facts."""
+    claims: list[dict[str, Any]] = []
     nodes_by_id = _node_lookup(payload.get("nodes") or [])
     for index, edge in enumerate(payload.get("edges") or []):
         if not isinstance(edge, dict):
             continue
         source = nodes_by_id.get(str(edge.get("source") or ""), {})
         target = nodes_by_id.get(str(edge.get("target") or ""), {})
-        source_label = source.get("label") or edge.get("source")
-        target_label = target.get("label") or edge.get("target")
-        questions[f"e{index}_supported"] = {
-            "type": "noul",
-            "instructions": (
-                f'Is the proposed dependency from "{source_label}" to "{target_label}" '
-                "supported by the transcript as a prerequisite, transition, or branch?"
-            ),
-            "criteria": {
-                "true": "The transcript supports this relationship",
-                "false": "The transcript does not support this relationship",
-            },
-        }
+        claims.append(
+            {
+                "id": f"e{index}",
+                "kind": "edge",
+                "index": index,
+                "text": _edge_claim_text(source, target, edge),
+                "source_ids": _cited_source_ids(edge, source, target),
+                "lane": str(source.get("lane") or target.get("lane") or "Unassigned"),
+            }
+        )
     for node in payload.get("nodes") or []:
         if not isinstance(node, dict):
             continue
-        if str(node.get("lane") or "") != "Unassigned":
-            continue
         node_id = str(node.get("id") or "")
-        label = node.get("label") or node_id
-        questions[f"{node_id}_owner_unknown"] = {
-            "type": "noul",
-            "instructions": (
-                f'Is the responsible role for "{label}" actually unknown in the transcript? '
-                "The speaker is not automatically the owner."
+        if not node_id:
+            continue
+        claims.append(
+            {
+                "id": f"n{node_id}",
+                "kind": "node",
+                "node_id": node_id,
+                "text": str(node.get("label") or node_id),
+                "source_ids": _cited_source_ids(node),
+                "lane": str(node.get("lane") or "Unassigned"),
+                "node_type": str(node.get("node_type") or ""),
+            }
+        )
+    for index, alternative in enumerate(payload.get("alternatives") or []):
+        if not isinstance(alternative, dict):
+            continue
+        claims.append(
+            {
+                "id": f"a{index}",
+                "kind": "alternative",
+                "index": index,
+                "text": str(alternative.get("label") or ""),
+                "source_ids": _cited_source_ids(alternative),
+                "lane": "Unassigned",
+            }
+        )
+    for index, fact in enumerate(payload.get("facts") or []):
+        if not isinstance(fact, dict):
+            continue
+        claims.append(
+            {
+                "id": f"f{index}",
+                "kind": "fact",
+                "index": index,
+                "text": str(fact.get("text") or ""),
+                "source_ids": _cited_source_ids(fact),
+                "lane": "Unassigned",
+            }
+        )
+    return claims
+
+
+def _shortlist_unused_alternative_segments(
+    segments: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Return segments that look like unused alternatives, without scoring the whole transcript."""
+    candidates: list[dict[str, str]] = []
+    for segment in segments:
+        text = str(segment.get("text") or "")
+        if not _UNUSED_ALT_TOKEN_RE.search(text):
+            continue
+        source_id = str(segment.get("source_id") or "")
+        if not source_id:
+            continue
+        candidates.append(
+            {
+                "source_id": source_id,
+                "text": text,
+                "speaker": str(segment.get("speaker") or ""),
+            }
+        )
+    return candidates
+
+
+def _jev_check_state(
+    segments: list[dict[str, str]],
+    claims: list[dict[str, Any]],
+    candidates: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Build named Decisions state for citation checks and unused-alternative recovery."""
+    return {
+        "description": (
+            "Source segments plus candidate workflow claims. Judge each claim "
+            "from its cited excerpts and the matching `segments` entries."
+        ),
+        "segments": [
+            {
+                "source_id": item.get("source_id"),
+                "speaker": item.get("speaker"),
+                "text": _clip_text(
+                    str(item.get("text") or ""), JEV_UTTERANCE_TEXT_CHARS
+                ),
+            }
+            for item in segments
+        ],
+        "claims": [
+            {
+                "id": claim["id"],
+                "kind": claim["kind"],
+                "text": claim["text"],
+                "source_ids": claim.get("source_ids") or [],
+            }
+            for claim in claims
+        ],
+        "candidates": [
+            {
+                "source_id": item["source_id"],
+                "text": _clip_text(item.get("text") or "", JEV_UTTERANCE_TEXT_CHARS),
+            }
+            for item in candidates
+        ],
+    }
+
+
+def _citation_question(
+    claim: dict[str, Any],
+    excerpts: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Build one Choice citation-check for a code-collected claim."""
+    return {
+        "type": "choice",
+        "instructions": {
+            "task": "How do the cited segments relate to the claim?",
+            "claim": claim["text"],
+            "claim_id": claim["id"],
+            "cited_excerpts": excerpts,
+            "use_segments": (
+                "Read `segments` entries whose source_id is listed on this claim."
             ),
-            "criteria": {
-                "true": "Responsibility is not named",
-                "false": "The transcript names a responsible role",
+        },
+        "criteria": _jev_citation_criteria(),
+    }
+
+
+def _jev_check_questions(
+    claims: list[dict[str, Any]],
+    candidates: list[dict[str, str]],
+    segments: list[dict[str, str]],
+) -> dict[str, dict[str, Any]]:
+    """Build citation-check Choices plus speculative decision, timing, and completion questions."""
+    questions: dict[str, dict[str, Any]] = {}
+    for claim in claims:
+        excerpts = _claim_excerpts(list(claim.get("source_ids") or []), segments)
+        questions[f"c_{claim['id']}"] = _citation_question(claim, excerpts)
+        if claim["kind"] in {"node", "edge", "fact"} and _has_day_count(
+            str(claim.get("text") or "")
+        ):
+            questions[f"t_{claim['id']}"] = {
+                "type": "noul",
+                "instructions": {
+                    "task": (
+                        "Do the cited segments disagree about this number or its "
+                        "reference event?"
+                    ),
+                    "claim": claim["text"],
+                    "cited_excerpts": excerpts,
+                },
+                "criteria": {
+                    "true": (
+                        "Cited segments disagree about the number or the event "
+                        "it is measured from"
+                    ),
+                    "false": "Cited segments agree on the number and its reference event",
+                },
+            }
+        if claim["kind"] == "node":
+            node_type = str(claim.get("node_type") or "")
+            label = str(claim.get("text") or "")
+            if node_type == "end" or _looks_completed(label):
+                questions[f"p_{claim['id']}"] = {
+                    "type": "noul",
+                    "instructions": {
+                        "task": "Does the transcript establish this as already completed?",
+                        "claim": label,
+                        "node_type": node_type,
+                        "cited_excerpts": excerpts,
+                    },
+                    "criteria": {
+                        "true": "The transcript reports this step as already done",
+                        "false": (
+                            "The transcript treats this as planned, future, or not yet done"
+                        ),
+                    },
+                }
+            if node_type == "decision":
+                questions[f"d_{claim['id']}"] = {
+                    "type": "choice",
+                    "instructions": {
+                        "task": "What kind of choice is this node in the transcript?",
+                        "claim": label,
+                        "cited_excerpts": excerpts,
+                    },
+                    "criteria": _jev_decision_kind_criteria(),
+                }
+    for candidate in candidates:
+        source_id = candidate["source_id"]
+        questions[f"alt_{source_id}"] = {
+            "type": "choice",
+            "instructions": {
+                "task": (
+                    "Is this segment an unused process alternative, an adopted step, "
+                    "background, or unrelated?"
+                ),
+                "source_id": source_id,
+                "text": _clip_text(
+                    candidate.get("text") or "", JEV_UTTERANCE_TEXT_CHARS
+                ),
+                "use_segments": (
+                    "Read the `segments` entry with this source_id and nearby process talk."
+                ),
             },
+            "criteria": _jev_unused_alternative_criteria(),
         }
     return questions
 
@@ -1803,62 +2267,379 @@ def _append_confirmation(
     )
 
 
+def _confirmation_with_excerpts(
+    question: str,
+    source_ids: list[str],
+    segments: list[dict[str, str]],
+) -> str:
+    """Append cited excerpts to a confirmation question when available."""
+    excerpt = _format_source_excerpts(source_ids, segments)
+    if excerpt:
+        return f"{question} Cited: {excerpt}."
+    return question
+
+
+def _citation_verdict(answer: Any) -> tuple[str, float]:
+    """Read a citation Choice, defaulting unknown values to says_nothing."""
+    choice, confidence = _choice_value(answer, "says_nothing")
+    if choice not in _jev_citation_criteria():
+        return "says_nothing", confidence
+    return choice, confidence
+
+
+def _noul_is_uncertain(value: float) -> bool:
+    """Return whether a Noul probability is too close to even to act on."""
+    return JEV_NOUL_UNCERTAIN_LOW <= value <= JEV_NOUL_UNCERTAIN_HIGH
+
+
+def _noul_is_affirmative(value: float) -> bool:
+    """Return whether a Noul is clearly yes, outside the uncertain band."""
+    return value > JEV_NOUL_UNCERTAIN_HIGH
+
+
+def _label_tokens(label: str) -> set[str]:
+    """Return comparable word tokens from an alternative label."""
+    return {word for word in re.findall(r"[a-z0-9]+", label.casefold()) if len(word) > 2}
+
+
+def _tokens_overlap(left: set[str], right: set[str]) -> bool:
+    """Return whether token sets share a word or a long shared stem."""
+    if left & right:
+        return True
+    for first in left:
+        for second in right:
+            if min(len(first), len(second)) < 6:
+                continue
+            if first.startswith(second) or second.startswith(first):
+                return True
+    return False
+
+
+def _labels_overlap(left: str, right: str) -> bool:
+    """Return whether two labels share a token or one contains the other."""
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    if not left_text or not right_text:
+        return False
+    if left_text.casefold() == right_text.casefold():
+        return True
+    left_folded = left_text.casefold()
+    right_folded = right_text.casefold()
+    if left_folded in right_folded or right_folded in left_folded:
+        return True
+    return _tokens_overlap(_label_tokens(left_text), _label_tokens(right_text))
+
+
+def _alternative_is_similar(existing: dict[str, Any], source_id: str, label: str) -> bool:
+    """Return whether an alternative already covers this source or overlapping label."""
+    existing_ids = {str(item) for item in existing.get("source_ids") or []}
+    if source_id and source_id in existing_ids:
+        return True
+    return _labels_overlap(str(existing.get("label") or ""), label)
+
+
+def _strip_holder_day_counts(holder: dict[str, Any], field: str) -> str:
+    """Strip day counts from a graph label field and return the original text."""
+    original = str(holder.get(field) or "")
+    stripped = _strip_day_counts(original)
+    is_edge = "source" in holder and "target" in holder
+    if stripped:
+        holder[field] = stripped
+    elif is_edge:
+        holder[field] = None
+    elif field == "label":
+        holder[field] = "Unresolved step"
+    holder["status"] = "unresolved"
+    return original
+
+
+def _apply_number_dispute(
+    holder: dict[str, Any],
+    field: str,
+    payload: dict[str, Any],
+    confidence: float,
+    source_ids: list[str],
+    segments: list[dict[str, str]],
+    lane: str,
+) -> None:
+    """Strip a disputed number and add a confirmation with competing source IDs."""
+    original = _strip_holder_day_counts(holder, field)
+    sources = ", ".join(source_ids) if source_ids else "the cited segments"
+    question = _confirmation_with_excerpts(
+        f"Confirm the timing in '{original}'. Competing sources: {sources}.",
+        source_ids,
+        segments,
+    )
+    _append_confirmation(payload, question, lane, confidence, source_ids)
+
+
+def _apply_claim_citation(
+    payload: dict[str, Any],
+    claim: dict[str, Any],
+    choice: str,
+    confidence: float,
+    nodes_by_id: dict[str, dict[str, Any]],
+    drop_edge_indexes: set[int],
+    segments: list[dict[str, str]],
+) -> None:
+    """Apply one citation-check verdict to the graph, keeping uncertain structure."""
+    auto = confidence >= JEV_AUTO_ACCEPT
+    cited = list(claim.get("source_ids") or [])
+    lane = str(claim.get("lane") or "Unassigned")
+    claim_text = str(claim.get("text") or "")
+    if choice == "supports" and auto:
+        return
+    if claim["kind"] == "edge":
+        index = int(claim.get("index") or 0)
+        edges = payload.get("edges") or []
+        edge = edges[index] if index < len(edges) and isinstance(edges[index], dict) else None
+        if edge is None:
+            return
+        if choice == "contradicts" and auto:
+            drop_edge_indexes.add(index)
+            if _has_day_count(str(edge.get("label") or "")):
+                _apply_number_dispute(
+                    edge, "label", payload, confidence, cited, segments, lane
+                )
+        question = _confirmation_with_excerpts(
+            f"Is '{claim_text}' supported by the transcript?",
+            cited,
+            segments,
+        )
+        _append_confirmation(payload, question, lane, confidence, cited)
+        return
+    if claim["kind"] == "node":
+        node = nodes_by_id.get(str(claim.get("node_id") or ""))
+        if node is None:
+            return
+        if choice == "contradicts" and auto:
+            if _has_day_count(str(node.get("label") or "")):
+                _apply_number_dispute(
+                    node, "label", payload, confidence, cited, segments, lane
+                )
+            if str(node.get("node_type") or "") == "end" or _looks_completed(
+                str(node.get("label") or "")
+            ):
+                node["node_type"] = "action"
+                node["status"] = "planned"
+        question = _confirmation_with_excerpts(
+            f"Do the cited segments support '{claim_text}'?",
+            cited,
+            segments,
+        )
+        _append_confirmation(payload, question, lane, confidence, cited)
+        return
+    kind = "fact" if claim["kind"] == "fact" else "alternative"
+    question = _confirmation_with_excerpts(
+        f"Do the cited segments support the {kind} '{claim_text}'?",
+        cited,
+        segments,
+    )
+    _append_confirmation(payload, question, lane, confidence, cited)
+
+
+def _apply_speculative_verdicts(
+    payload: dict[str, Any],
+    answers: dict[str, Any],
+    claims: list[dict[str, Any]],
+    nodes_by_id: dict[str, dict[str, Any]],
+    segments: list[dict[str, str]],
+) -> None:
+    """Apply decision, timing, and completion companions when those answers exist."""
+    for claim in claims:
+        claim_id = str(claim.get("id") or "")
+        cited = list(claim.get("source_ids") or [])
+        lane = str(claim.get("lane") or "Unassigned")
+        timing_key = f"t_{claim_id}"
+        if timing_key in answers:
+            disputed = _noul_value(answers.get(timing_key))
+            if not _noul_is_uncertain(disputed) and _noul_is_affirmative(disputed):
+                if claim["kind"] == "node":
+                    node = nodes_by_id.get(str(claim.get("node_id") or ""))
+                    if node is not None and _has_day_count(str(node.get("label") or "")):
+                        _apply_number_dispute(
+                            node, "label", payload, disputed, cited, segments, lane
+                        )
+                elif claim["kind"] == "edge":
+                    index = int(claim.get("index") or 0)
+                    edges = payload.get("edges") or []
+                    edge = (
+                        edges[index]
+                        if index < len(edges) and isinstance(edges[index], dict)
+                        else None
+                    )
+                    if edge is not None and _has_day_count(str(edge.get("label") or "")):
+                        _apply_number_dispute(
+                            edge, "label", payload, disputed, cited, segments, lane
+                        )
+                elif claim["kind"] == "fact":
+                    facts = payload.get("facts") or []
+                    index = int(claim.get("index") or 0)
+                    fact = (
+                        facts[index]
+                        if index < len(facts) and isinstance(facts[index], dict)
+                        else None
+                    )
+                    if fact is not None and _has_day_count(str(fact.get("text") or "")):
+                        _apply_number_dispute(
+                            fact, "text", payload, disputed, cited, segments, lane
+                        )
+            elif _noul_is_uncertain(disputed) or _noul_is_affirmative(disputed):
+                question = _confirmation_with_excerpts(
+                    f"Do the cited segments disagree about the number in '{claim.get('text')}'?",
+                    cited,
+                    segments,
+                )
+                _append_confirmation(payload, question, lane, disputed, cited)
+        if claim["kind"] != "node":
+            continue
+        node = nodes_by_id.get(str(claim.get("node_id") or ""))
+        if node is None:
+            continue
+        completed_key = f"p_{claim_id}"
+        if completed_key in answers:
+            completed = _noul_value(answers.get(completed_key))
+            if not _noul_is_uncertain(completed) and not _noul_is_affirmative(completed):
+                node["node_type"] = "action"
+                node["status"] = "planned"
+                question = _confirmation_with_excerpts(
+                    f"Does the transcript establish '{claim.get('text')}' as already completed?",
+                    cited,
+                    segments,
+                )
+                _append_confirmation(payload, question, lane, completed, cited)
+            elif _noul_is_uncertain(completed):
+                question = _confirmation_with_excerpts(
+                    f"Does the transcript establish '{claim.get('text')}' as already completed?",
+                    cited,
+                    segments,
+                )
+                _append_confirmation(payload, question, lane, completed, cited)
+        decision_key = f"d_{claim_id}"
+        if decision_key in answers:
+            kind, confidence = _choice_value(answers.get(decision_key), "open_choice")
+            if kind not in _jev_decision_kind_criteria():
+                kind = "open_choice"
+            if kind == "one_adopted" and confidence >= JEV_AUTO_ACCEPT:
+                node["node_type"] = "action"
+            elif kind != "open_choice" or confidence < JEV_AUTO_ACCEPT:
+                question = _confirmation_with_excerpts(
+                    f"Is '{claim.get('text')}' still an open choice?",
+                    cited,
+                    segments,
+                )
+                _append_confirmation(payload, question, lane, confidence, cited)
+
+
+def _merge_jev_alternatives(
+    payload: dict[str, Any],
+    answers: dict[str, Any],
+    candidates: list[dict[str, str]],
+) -> None:
+    """Keep Mercury alternatives unless rejected; add high-confidence unused options."""
+    existing = [
+        item
+        for item in payload.get("alternatives") or []
+        if isinstance(item, dict)
+    ]
+    kept: list[dict[str, Any]] = []
+    for alternative in existing:
+        rejected = False
+        unused_support = False
+        for candidate in candidates:
+            source_id = candidate["source_id"]
+            key = f"alt_{source_id}"
+            if key not in answers:
+                continue
+            if not _alternative_is_similar(
+                alternative, source_id, str(candidate.get("text") or "")
+            ):
+                continue
+            choice, confidence = _choice_value(answers.get(key), "unrelated")
+            if choice not in _jev_unused_alternative_criteria():
+                choice = "unrelated"
+            if confidence < JEV_AUTO_ACCEPT:
+                continue
+            if choice == "unused_alternative":
+                unused_support = True
+            elif choice in {"adopted_step", "background", "unrelated"}:
+                rejected = True
+        if rejected and not unused_support:
+            continue
+        kept.append(alternative)
+    for candidate in candidates:
+        source_id = candidate["source_id"]
+        key = f"alt_{source_id}"
+        if key not in answers:
+            continue
+        choice, confidence = _choice_value(answers.get(key), "unrelated")
+        if choice != "unused_alternative" or confidence < JEV_AUTO_ACCEPT:
+            continue
+        label = _clip_at_word(str(candidate.get("text") or ""), JEV_ALT_LABEL_CHARS)
+        if any(_alternative_is_similar(item, source_id, label) for item in kept):
+            continue
+        kept.append(
+            {
+                "label": label or str(candidate.get("text") or source_id),
+                "source_ids": [source_id],
+                "status": "alternative",
+            }
+        )
+    payload["alternatives"] = kept
+
+
+def _apply_jev_verdicts(
+    payload: dict[str, Any],
+    answers: dict[str, Any],
+    claims: list[dict[str, Any]],
+    candidates: list[dict[str, str]],
+    segments: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Apply confidence-gated graph edits from Jev answers; code owns the writes."""
+    _ensure_workflow_lists(payload)
+    nodes_by_id = _node_lookup(payload.get("nodes") or [])
+    drop_edge_indexes: set[int] = set()
+    for claim in claims:
+        key = f"c_{claim['id']}"
+        if key not in answers:
+            continue
+        choice, confidence = _citation_verdict(answers.get(key))
+        _apply_claim_citation(
+            payload,
+            claim,
+            choice,
+            confidence,
+            nodes_by_id,
+            drop_edge_indexes,
+            segments,
+        )
+    _apply_speculative_verdicts(payload, answers, claims, nodes_by_id, segments)
+    payload["edges"] = [
+        edge
+        for index, edge in enumerate(payload.get("edges") or [])
+        if not isinstance(edge, dict) or index not in drop_edge_indexes
+    ]
+    _merge_jev_alternatives(payload, answers, candidates)
+    return payload
+
+
 def _jev_bounded_graph_checks(
     payload: dict[str, Any],
     segments: list[dict[str, str]],
     api_key: str,
     model: str,
 ) -> dict[str, Any]:
-    """Drop unsupported edges and confirm Unassigned owners using Jev Decisions."""
+    """Check cited Mercury claims with Jev and recover unused alternatives."""
     _ensure_workflow_lists(payload)
-    questions = _jev_graph_check_questions(payload)
+    claims = _collect_jev_claims(payload)
+    candidates = _shortlist_unused_alternative_segments(segments)
+    questions = _jev_check_questions(claims, candidates, segments)
     if not questions:
         return payload
     answers = _ask_jev_question_batch(
-        api_key, model, _jev_graph_check_state(segments, payload), questions
+        api_key, model, _jev_check_state(segments, claims, candidates), questions
     )
-    nodes_by_id = _node_lookup(payload.get("nodes") or [])
-    kept_edges: list[dict[str, Any]] = []
-    for index, edge in enumerate(payload.get("edges") or []):
-        if not isinstance(edge, dict):
-            continue
-        supported = _noul_value(answers.get(f"e{index}_supported"))
-        if supported >= 0.5:
-            kept_edges.append(edge)
-            continue
-        source = nodes_by_id.get(str(edge.get("source") or ""), {})
-        target = nodes_by_id.get(str(edge.get("target") or ""), {})
-        cited = _cited_source_ids(edge, source, target)
-        question = (
-            f"Is '{target.get('label') or edge.get('target')}' dependent on "
-            f"'{source.get('label') or edge.get('source')}'?"
-        )
-        excerpt = _format_source_excerpts(cited, segments)
-        if excerpt:
-            question = f"{question} Cited: {excerpt}."
-        _append_confirmation(
-            payload,
-            question,
-            str(source.get("lane") or "Unassigned"),
-            supported,
-            cited,
-        )
-    payload["edges"] = kept_edges
-    for node in payload.get("nodes") or []:
-        if not isinstance(node, dict):
-            continue
-        if str(node.get("lane") or "") != "Unassigned":
-            continue
-        node_id = str(node.get("id") or "")
-        unknown = _noul_value(answers.get(f"{node_id}_owner_unknown"))
-        _append_confirmation(
-            payload,
-            f"Who is responsible for '{node.get('label') or node_id}'?",
-            "Unassigned",
-            unknown,
-            _cited_source_ids(node),
-        )
-    return payload
+    return _apply_jev_verdicts(payload, answers, claims, candidates, segments)
 
 
 def analyze_transcript_with_jev(
@@ -1867,7 +2648,7 @@ def analyze_transcript_with_jev(
     model: str = JEV_MODEL,
     translate_to_english: bool = False,
 ) -> dict[str, Any]:
-    """Synthesize a workflow with Mercury and check supported relationships with Jev."""
+    """Synthesize a workflow with Mercury, then check cited claims and recover unused alternatives with Jev."""
     if not str(transcript_text).strip():
         raise ValueError("Meeting transcript is empty.")
     parsed = _parse_transcript_utterances(transcript_text)

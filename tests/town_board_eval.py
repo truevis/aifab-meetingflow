@@ -1,4 +1,4 @@
-"""Shared live-evaluation helper for the town-board sample transcript."""
+"""Shared live-evaluation helper for flowchart engines on vids transcripts."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS_DIR = Path(__file__).resolve().parent
+VIDS_DIR = ROOT / "vids"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -25,7 +26,15 @@ from utils.meeting_analyzer import (
 )
 from utils.workflow_validator import validate_workflow_graph
 
-SAMPLE_TRANSCRIPT_PATH = ROOT / "vids" / "sample transcript.txt"
+SAMPLE_TRANSCRIPT_PATH = VIDS_DIR / "sample transcript.txt"
+TOWN_MEETING_PATH = VIDS_DIR / "town meeting 2 .txt"
+PROBATE_PATH = VIDS_DIR / "probate.txt"
+
+TRANSCRIPT_CASES: dict[str, Path] = {
+    "sample": SAMPLE_TRANSCRIPT_PATH,
+    "town_meeting_2": TOWN_MEETING_PATH,
+    "probate": PROBATE_PATH,
+}
 
 
 def load_openrouter_api_key() -> str:
@@ -45,6 +54,11 @@ def load_sample_transcript() -> str:
     return SAMPLE_TRANSCRIPT_PATH.read_text(encoding="utf-8")
 
 
+def load_transcript(path: Path) -> str:
+    """Load a transcript text file."""
+    return path.read_text(encoding="utf-8")
+
+
 def _joined_text(items: list[Any], keys: tuple[str, ...]) -> str:
     """Join string fields from dict or string items."""
     parts: list[str] = []
@@ -61,17 +75,46 @@ def _joined_text(items: list[Any], keys: tuple[str, ...]) -> str:
     return " ".join(parts).casefold()
 
 
+def _coverage_blob(payload: dict[str, Any]) -> str:
+    """Join node labels with alternatives, facts, side notes, and confirmations."""
+    nodes = payload.get("nodes") or []
+    labels = [str(node.get("label") or "") for node in nodes if isinstance(node, dict)]
+    return " ".join(
+        [
+            " ".join(labels),
+            _joined_text(payload.get("alternatives") or [], ("label", "text")),
+            _joined_text(payload.get("facts") or [], ("text", "label")),
+            _joined_text(payload.get("side_notes") or [], ("label", "text")),
+            _joined_text(payload.get("uncited_excerpts") or [], ("label", "text")),
+            _joined_text(payload.get("confirmations") or [], ("question",)),
+        ]
+    ).casefold()
+
+
+def _node_label_blob(payload: dict[str, Any]) -> str:
+    """Join node and edge labels only."""
+    nodes = payload.get("nodes") or []
+    labels = [str(node.get("label") or "") for node in nodes if isinstance(node, dict)]
+    return (
+        " ".join(labels)
+        + " "
+        + _joined_text(payload.get("edges") or [], ("label",))
+    ).casefold()
+
+
+def _require_any(blob: str, tokens: tuple[str, ...], miss: str, misses: list[str]) -> None:
+    """Append miss when none of the tokens appear in blob."""
+    if not any(token in blob for token in tokens):
+        misses.append(miss)
+
+
 def score_town_board_expectations(payload: dict[str, Any]) -> list[str]:
     """Return expectation misses for the town-board sample; not schema failures."""
     misses: list[str] = []
     nodes = payload.get("nodes") or []
     labels = [str(node.get("label") or "") for node in nodes if isinstance(node, dict)]
     label_blob = " ".join(labels).casefold()
-    alternatives = payload.get("alternatives") or []
-    confirmations = payload.get("confirmations") or []
-    side_blob = _joined_text(alternatives, ("label", "text")) + " " + _joined_text(
-        confirmations, ("question",)
-    )
+    side_blob = _coverage_blob(payload)
 
     if any(label.strip().casefold() == "complete" for label in labels):
         misses.append("Invented Complete endpoint.")
@@ -124,7 +167,7 @@ def score_town_board_expectations(payload: dict[str, Any]) -> list[str]:
                 f"Completed-result wording on planned/end node {node.get('id')}."
             )
     graph_blob = label_blob + " " + _joined_text(payload.get("edges") or [], ("label",))
-    conf_blob = _joined_text(confirmations, ("question",))
+    conf_blob = _joined_text(payload.get("confirmations") or [], ("question",))
     has_day_count = bool(
         re.search(
             r"\b\d{1,3}\s*(?:[-–/]\s*\d{1,3})?\s*-?\s*days?\b",
@@ -140,6 +183,113 @@ def score_town_board_expectations(payload: dict[str, Any]) -> list[str]:
             "A day count is asserted in a label while confirmations still dispute timing."
         )
     return misses
+
+
+def score_town_meeting_expectations(payload: dict[str, Any]) -> list[str]:
+    """Return skip/invent misses for the multi-topic town meeting transcript."""
+    misses: list[str] = []
+    coverage = _coverage_blob(payload)
+    graph = _node_label_blob(payload)
+    _require_any(
+        coverage,
+        ("certificate", "appreciation"),
+        "Appreciation certificate topic is missing from nodes or side notes.",
+        misses,
+    )
+    _require_any(
+        coverage,
+        ("constable", "process serv"),
+        "Constable appointment topic is missing from nodes or side notes.",
+        misses,
+    )
+    _require_any(
+        coverage,
+        ("historic", "hdc", "citizen petition", "petition"),
+        "Historic-district petition topic is missing from nodes or side notes.",
+        misses,
+    )
+    _require_any(
+        coverage,
+        ("tower", "rfp", "cell"),
+        "Tower RFP topic is missing from nodes or side notes.",
+        misses,
+    )
+    if re.search(r"\b30\s*-?\s*days?\b", graph, re.IGNORECASE) and not any(
+        token in _joined_text(payload.get("confirmations") or [], ("question",))
+        for token in ("30", "days", "post", "publish", "timing")
+    ):
+        misses.append("Settled 30-day posting rule appears without unresolved confirmation.")
+    return misses
+
+
+def score_probate_expectations(payload: dict[str, Any]) -> list[str]:
+    """Return skip/invent misses for the Louisiana succession narration."""
+    misses: list[str] = []
+    coverage = _coverage_blob(payload)
+    graph = _node_label_blob(payload)
+    _require_any(
+        coverage,
+        ("review", "will"),
+        "Review-will step is missing from nodes or side notes.",
+        misses,
+    )
+    _require_any(
+        coverage,
+        ("independent executor", "executor agreement", "agreements"),
+        "Independent-executor agreements topic is missing from nodes or side notes.",
+        misses,
+    )
+    _require_any(
+        coverage,
+        ("clerk", "file", "court"),
+        "Filing with the clerk/court is missing from nodes or side notes.",
+        misses,
+    )
+    _require_any(
+        coverage,
+        ("judge", "confirm", "probate"),
+        "Judge confirmation / probating the will is missing from nodes or side notes.",
+        misses,
+    )
+    _require_any(
+        coverage,
+        ("letters", "testamentary"),
+        "Letters of independent executorship are missing from nodes or side notes.",
+        misses,
+    )
+    _require_any(
+        coverage,
+        ("tax id", "ein", "taxpayer"),
+        "Estate tax ID topic is missing from nodes or side notes.",
+        misses,
+    )
+    _require_any(
+        coverage,
+        ("account", "bank"),
+        "Estate accounts topic is missing from nodes or side notes.",
+        misses,
+    )
+    invented = (
+        "inventory appraisal",
+        "publish notice to creditors",
+        "final accounting hearing",
+        "close the estate",
+    )
+    for phrase in invented:
+        if phrase in graph:
+            misses.append(f"Invented checklist step on graph: {phrase}.")
+    if "payable on death" in graph or "pod bond" in graph:
+        misses.append("Payable-on-death bonds appear on the main graph path.")
+    return misses
+
+
+def score_transcript_expectations(case_id: str, payload: dict[str, Any]) -> list[str]:
+    """Score skip/invent anchors for a named transcript case."""
+    if case_id == "town_meeting_2":
+        return score_town_meeting_expectations(payload)
+    if case_id == "probate":
+        return score_probate_expectations(payload)
+    return score_town_board_expectations(payload)
 
 
 def score_utterance_coverage(payload: dict[str, Any], source_count: int) -> list[str]:
@@ -159,10 +309,13 @@ def score_petition_evidence(payload: dict[str, Any]) -> list[str]:
     """Check the fixture's known petition excerpts, not arbitrary IDs."""
     petition_sources = {"U56", "U67"}
     unrelated_sources = {"U13", "U14"}
-    for item in payload.get("alternatives") or []:
+    for item in list(payload.get("alternatives") or []) + list(
+        payload.get("side_notes") or []
+    ):
         if not isinstance(item, dict):
             continue
-        if "petition" not in str(item.get("label") or "").casefold():
+        label = str(item.get("label") or item.get("text") or "").casefold()
+        if "petition" not in label:
             continue
         cited = set(item.get("source_ids") or [])
         misses = []
@@ -190,6 +343,13 @@ def _sample_json_path(engine: str) -> Path:
     return TESTS_DIR / f"test_{engine}_sample.json"
 
 
+def _case_json_path(engine: str, case_id: str) -> Path:
+    """Return the JSON report path for one engine and transcript case."""
+    if case_id == "sample":
+        return _sample_json_path(engine)
+    return TESTS_DIR / f"test_{engine}_{case_id}.json"
+
+
 def save_engine_sample_json(engine: str, report: dict[str, Any]) -> Path:
     """Write a live engine sample report to JSON in the tests folder."""
     path = _sample_json_path(engine)
@@ -200,10 +360,26 @@ def save_engine_sample_json(engine: str, report: dict[str, Any]) -> Path:
     return path
 
 
-def _failure_report(engine: str, elapsed_seconds: float, error: str) -> dict[str, Any]:
+def save_engine_case_json(engine: str, case_id: str, report: dict[str, Any]) -> Path:
+    """Write a live engine/transcript report to JSON in the tests folder."""
+    path = _case_json_path(engine, case_id)
+    path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _failure_report(
+    engine: str,
+    elapsed_seconds: float,
+    error: str,
+    case_id: str = "sample",
+) -> dict[str, Any]:
     """Build a JSON report for a failed engine sample run."""
     return {
         "engine": engine,
+        "transcript": case_id,
         "ok": False,
         "elapsed_seconds": round(elapsed_seconds, 3),
         "error": error,
@@ -215,19 +391,23 @@ def _success_report(
     payload: dict[str, Any],
     elapsed_seconds: float,
     misses: list[str],
+    case_id: str = "sample",
 ) -> dict[str, Any]:
     """Build a JSON report for a successful engine sample run."""
     nodes = payload.get("nodes") or []
     return {
         "engine": engine,
+        "transcript": case_id,
         "ok": True,
         "elapsed_seconds": round(elapsed_seconds, 3),
         "node_count": len(nodes),
         "edge_count": len(payload.get("edges") or []),
         "lane_count": len(payload.get("lanes") or []),
+        "side_note_count": len(payload.get("side_notes") or []),
         "labels": [node.get("label") for node in nodes if isinstance(node, dict)],
         "confirmations": payload.get("confirmations") or [],
         "alternatives": payload.get("alternatives") or [],
+        "side_notes": payload.get("side_notes") or [],
         "validation_warnings": payload.get("validation_warnings") or [],
         "expectation_misses": misses,
         "payload": payload,
@@ -237,6 +417,8 @@ def _success_report(
 def print_workflow_report(report: dict[str, Any]) -> None:
     """Print a compact workflow evaluation report."""
     print(f"engine: {report['engine']}")
+    if report.get("transcript"):
+        print(f"transcript: {report['transcript']}")
     print(f"elapsed_seconds: {report['elapsed_seconds']:.1f}")
     if not report.get("ok"):
         print(f"FAILURE: {report.get('error')}")
@@ -258,25 +440,34 @@ def print_workflow_report(report: dict[str, Any]) -> None:
         print("expectation_misses: none")
 
 
-def _write_and_print_report(engine: str, report: dict[str, Any]) -> Path:
+def _write_and_print_report(
+    engine: str,
+    report: dict[str, Any],
+    case_id: str = "sample",
+) -> Path:
     """Save the report JSON in tests/ and print the compact summary."""
-    path = save_engine_sample_json(engine, report)
+    path = save_engine_case_json(engine, case_id, report)
     print_workflow_report(report)
     print(f"wrote: {path}")
     return path
 
 
-def run_engine_sample(engine: str) -> int:
-    """Run one engine on the town-board transcript and save the evaluation JSON."""
+def run_engine_transcript(engine: str, case_id: str) -> int:
+    """Run one engine on one named transcript case and save the evaluation JSON."""
+    path = TRANSCRIPT_CASES.get(case_id)
+    if path is None:
+        error = f"Unknown transcript case: {case_id}"
+        _write_and_print_report(engine, _failure_report(engine, 0.0, error, case_id), case_id)
+        return 1
     api_key = load_openrouter_api_key()
     if not api_key:
         error = "OPENROUTER_API_KEY is missing from the environment and .streamlit/secrets.toml."
-        _write_and_print_report(engine, _failure_report(engine, 0.0, error))
+        _write_and_print_report(engine, _failure_report(engine, 0.0, error, case_id), case_id)
         return 1
-    transcript = load_sample_transcript().strip()
+    transcript = load_transcript(path).strip()
     if not transcript:
-        error = f"Sample transcript is empty: {SAMPLE_TRANSCRIPT_PATH}"
-        _write_and_print_report(engine, _failure_report(engine, 0.0, error))
+        error = f"Transcript is empty: {path}"
+        _write_and_print_report(engine, _failure_report(engine, 0.0, error, case_id), case_id)
         return 1
     started = time.perf_counter()
     try:
@@ -284,12 +475,24 @@ def run_engine_sample(engine: str) -> int:
         validate_workflow_graph(payload)
     except Exception as error:
         elapsed = time.perf_counter() - started
-        _write_and_print_report(engine, _failure_report(engine, elapsed, str(error)))
+        _write_and_print_report(
+            engine, _failure_report(engine, elapsed, str(error), case_id), case_id
+        )
         return 1
     elapsed = time.perf_counter() - started
     source_count = len(_workflow_source_segments(transcript))
-    misses = score_town_board_expectations(payload)
+    misses = score_transcript_expectations(case_id, payload)
     misses.extend(score_utterance_coverage(payload, source_count))
-    misses.extend(score_petition_evidence(payload))
-    _write_and_print_report(engine, _success_report(engine, payload, elapsed, misses))
-    return 0
+    if case_id == "sample":
+        misses.extend(score_petition_evidence(payload))
+    _write_and_print_report(
+        engine,
+        _success_report(engine, payload, elapsed, misses, case_id),
+        case_id,
+    )
+    return 0 if not misses else 0
+
+
+def run_engine_sample(engine: str) -> int:
+    """Run one engine on the town-board transcript and save the evaluation JSON."""
+    return run_engine_transcript(engine, "sample")
