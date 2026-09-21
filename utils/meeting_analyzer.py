@@ -22,7 +22,7 @@ OPENROUTER_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
 DEFAULT_MODEL = "inception/mercury-2.5"
 JEV_MODEL = "~typesafe/jev-latest"
 GLM_FLASH_LATEST_MODEL = "~z-ai/glm-flash-latest"
-GEMINI_FLASH_MODEL = "google/gemini-3.8-flash"
+GEMINI_FLASH_MODEL = "google/gemini-3.8-flash:floor"
 DEFAULT_VL_MODEL = "inclusionai/ling-3.0-flash-vl:free"
 TRANSCRIPTION_CONNECT_TIMEOUT_SECONDS = 60
 TRANSCRIPTION_TIMEOUT_SECONDS = 900
@@ -1164,6 +1164,19 @@ def analyze_transcript_with_glm(
     )
 
 
+def _openrouter_gemini_floor_model(model: str) -> str:
+    """Route Gemini chat requests through OpenRouter's lowest-cost :floor variant."""
+    value = str(model).strip()
+    if not value.startswith("google/gemini"):
+        return value
+    if value.endswith(":floor"):
+        return value
+    model_name = value.split("/", 1)[-1]
+    if ":" in model_name:
+        return value
+    return f"{value}:floor"
+
+
 def analyze_transcript_with_gemini(
     transcript_text: str,
     api_key: str,
@@ -1174,7 +1187,7 @@ def analyze_transcript_with_gemini(
     return _analyze_transcript_with_openrouter(
         transcript_text,
         api_key=api_key,
-        model=model,
+        model=_openrouter_gemini_floor_model(model),
         translate_to_english=translate_to_english,
         timeout_seconds=GEMINI_TIMEOUT_SECONDS,
     )
